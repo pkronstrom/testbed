@@ -1,0 +1,62 @@
+# Publish the shelf.
+#
+# Runs on every push -- including the pushes that app repositories make into
+# their own subdirectories -- so deploying an app is a single git push from
+# somewhere else, with no edit here.
+
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write      # the indexing step commits apps.json back
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Index the deployed apps
+        run: node .github/scripts/index-apps.mjs
+
+      - name: Commit apps.json if it changed
+        run: |
+          if [ -n "$(git status --porcelain apps.json)" ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add apps.json
+            git commit -m "Reindex the shelf"
+            git push
+          else
+            echo "apps.json unchanged"
+          fi
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: .
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
