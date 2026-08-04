@@ -1,0 +1,2353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Weld engine — the edit loop</title>
+<!--
+  Standalone EDITOR for the weld-first engine (B0-B5).
+
+  Classic script tags, no build step, no CDN: this must open from file:// the
+  same way index.html does. It touches nothing in packraft-core or app/ — the
+  old app is untouched and keeps working.
+
+  B2 made the edit loop real (ops with inverses, a template library, live
+  gates). B3 gives it the canvas the plan asks for (decision 2, and v4's
+  "designer's mental model"): TWO ORTHOGRAPHIC PANES, top and side, with a
+  reference-photo underlay, where the boat is a LINE mirrored across the
+  centreplane and the DOTS ON THE LINE are the welds. Drag a dot and the boat
+  re-lofts; drag its edge and the section changes; type the number instead if
+  you know it.
+
+  B5 adds the SECTION INSET at the top of the inspector column: the selected
+  weld's own curve, drawn in its own plane, with one draggable handle per
+  profile knot. A handle drag is `ops.editProfile` with the station deviations
+  -- the same one-gesture-one-undo-step contract, the same throttled preview
+  build, and no geometry of its own beyond projecting the weld's plane onto
+  two axes.
+
+  B6 adds the ANALYSIS STRIP: a load, a pressure, and everything the observers
+  in engine/analysis.js can say about the boat those two numbers describe --
+  the waterline drawn in the 3D view with the immersed hull tinted below it,
+  the displacement split between the tubes and the floor bathtub, freeboard,
+  reserve, wetted area, per-weld hoop advisories joining the gate table, and a
+  suggest-seams button that previews its proposal as ghost dots before it
+  touches anything.
+
+  THE LOAD AND THE PRESSURE ARE UI STATE. They are not in the document, not in
+  the permalink and not in the export: a cutting pattern carries no
+  hydrostatics, and a builder tracing an outline must not find it depends on
+  how heavy the designer said they were. Same rule as the photo underlay.
+
+  Everything the panes do goes through engine/ops.js. This file owns no
+  geometry: it projects, it hit-tests, and it calls ops. The one number it
+  keeps to itself is the photo underlay transform, which is a property of the
+  session and not of the boat (the plan is explicit: NOT in the document).
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font: 13px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: #14161a; color: #d7dde5;
+    display: grid; grid-template-rows: auto auto auto 1fr auto; height: 100%;
+  }
+  header, #tools, #analysis {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 6px 14px; border-bottom: 1px solid #262c35; background: #171a1f;
+  }
+  header h1 { font-size: 14px; margin: 0; font-weight: 600; letter-spacing: .01em; }
+  .sub { color: #8994a3; font-size: 12px; }
+  .spacer { flex: 1; }
+  button, select, input {
+    font: inherit; padding: 3px 9px; border-radius: 5px;
+    background: #232932; color: #d7dde5; border: 1px solid #333c48;
+  }
+  button, select { cursor: pointer; }
+  button:hover:not(:disabled) { background: #2b323d; }
+  button:disabled { opacity: .35; cursor: default; }
+  input[type=number] { width: 84px; text-align: right; font-variant-numeric: tabular-nums; }
+  input[type=range] { padding: 0; width: 74px; vertical-align: middle; }
+  input[type=file] { padding: 1px; font-size: 11px; width: 118px; }
+  label { color: #8994a3; }
+  .group { display: flex; align-items: center; gap: 4px; padding-left: 9px;
+           border-left: 1px solid #2b323d; }
+
+  main {
+    display: grid; min-height: 0;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr) 268px;
+    grid-template-rows: 1fr 1fr;
+  }
+  .pane { position: relative; min-height: 0; min-width: 0; overflow: hidden;
+          border-left: 1px solid #262c35; border-top: 1px solid #262c35; }
+  #view3d { grid-area: 1 / 1; border-left: 0; border-top: 0; background: #14161a; }
+  #flat   { grid-area: 2 / 1; border-left: 0; background: #101216; }
+  #top    { grid-area: 1 / 2; background: #101216; }
+  #side   { grid-area: 2 / 2; background: #101216; }
+  #inspector { grid-area: 1 / 3 / 3 / 4; border-left: 1px solid #262c35;
+               background: #171a1f; overflow: auto; padding: 8px 10px; }
+  #view3d canvas { display: block; width: 100%; height: 100%; }
+  .pane > svg { width: 100%; height: 100%; display: block; touch-action: none; }
+  #flat path.panel { cursor: pointer; }
+
+  .paneName { position: absolute; left: 8px; top: 6px; pointer-events: none;
+              color: #6f7c8c; font-size: 11px; letter-spacing: .09em; text-transform: uppercase; }
+  .paneBar { position: absolute; right: 6px; top: 4px; display: flex; gap: 5px;
+             align-items: center; background: rgba(20,22,26,.82); padding: 3px 6px;
+             border: 1px solid #262c35; border-radius: 6px; font-size: 11px; }
+  .paneBar label { font-size: 11px; }
+  .paneBar input[type=number] { width: 62px; padding: 1px 4px; font-size: 11px; }
+  .hint { position: absolute; left: 8px; bottom: 6px; color: #55606f; font-size: 11px;
+          pointer-events: none; }
+
+  /* The section inset: the selected weld's own curve, in its own plane, with
+     one draggable handle per profile knot. Fixed height so the pane below it
+     does not jump as the boat changes. */
+  #sectionBox { position: relative; height: 236px; margin-bottom: 6px;
+                border: 1px solid #262c35; border-radius: 6px; background: #101216; }
+  #sectionBox svg { width: 100%; height: 100%; display: block; touch-action: none; }
+  #sectionBox .hint { left: 7px; bottom: 5px; }
+
+  #inspector h2 { font-size: 11px; letter-spacing: .09em; text-transform: uppercase;
+                  color: #6f7c8c; margin: 10px 0 6px; font-weight: 600; }
+  #inspector h2:first-child { margin-top: 0; }
+  .field { display: flex; align-items: center; justify-content: space-between; gap: 6px;
+           margin-bottom: 4px; }
+  .field label { flex: 1; }
+  .field input[type=number] { width: 96px; }
+  .note { color: #6f7c8c; font-size: 11px; margin: 4px 0 0; }
+
+  footer { border-top: 1px solid #262c35; background: #171a1f; padding: 6px 14px;
+           max-height: 26vh; overflow: auto; }
+  footer.stale { opacity: .45; }
+  table { border-collapse: collapse; font-size: 12px; width: 100%; }
+  th, td { text-align: left; padding: 2px 10px 2px 0; white-space: nowrap; }
+  th { color: #8994a3; font-weight: 500; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .ok { color: #6fbf73; } .advisory { color: #d7c46a; }
+  .warn { color: #e0a45c; } .error { color: #e2705f; }
+  .msg { color: #96a1b0; white-space: normal; }
+  .pill { display: inline-block; padding: 1px 7px; border-radius: 999px; border: 1px solid #333c48; }
+  .pill.good { color: #6fbf73; border-color: #2f5c36; }
+  .pill.bad { color: #e2705f; border-color: #5c2f2f; }
+
+  /* The analysis strip. Deliberately a DIFFERENT colour from the edit tools
+     above it: nothing on this row changes the boat, and the one control that
+     does (suggest seams) hands back a preview you have to confirm. */
+  #analysis { background: #151b1d; border-bottom-color: #22303033; }
+  #analysis .readout { color: #8fb8c4; font-variant-numeric: tabular-nums; }
+  #analysis .readout b { color: #cfe6ee; font-weight: 600; }
+  #analysis .warnish { color: #e0a45c; }
+  #analysis input[type=number] { width: 68px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Weld engine</h1>
+  <label class="sub" for="tpl">start from</label>
+  <select id="tpl"></select>
+  <span class="sub" id="title">—</span>
+  <span class="spacer"></span>
+  <span class="sub" id="stats">—</span>
+  <span id="gate" class="pill">—</span>
+</header>
+
+<div id="tools">
+  <span class="sub" id="sel">click a dot in the top or side view</span>
+  <span class="group">
+    <label>seams</label>
+    <button id="btn-add" disabled>add here</button>
+    <button id="btn-del" disabled>remove weld</button>
+  </span>
+  <span class="group">
+    <label for="soft">soft radius</label>
+    <input type="number" id="soft" value="0" step="50" min="0" title="mm of centreline arclength; 0 = drag one dot">
+    <span class="sub">mm</span>
+  </span>
+  <span class="group">
+    <label><input type="checkbox" id="lock" checked> uniform b</label>
+  </span>
+  <span class="group">
+    <label>blueprint</label>
+    <button id="btn-svg">export SVG</button>
+    <label for="roll" title="Usable fabric roll width, mm. The packer treats it as a hard constraint and minimises the length.">roll</label>
+    <input type="number" id="roll" value="1500" step="50" min="200" max="4000">
+    <select id="page" title="tiled print page size"></select>
+    <button id="btn-print">print tiled</button>
+    <label title="Draw each mirrored pair once and flip the pattern for the second cut. Off draws every piece."><input type="checkbox" id="mirror-once" checked> mirrored parts once</label>
+    <button id="btn-link">copy link</button>
+  </span>
+  <span class="spacer"></span>
+  <span class="sub" id="exportNote"></span>
+  <button id="btn-undo" disabled>undo</button>
+  <button id="btn-fit">fit views</button>
+  <button id="btn-reset">reset</button>
+</div>
+
+<!-- ANALYSIS. Reads the boat; never writes it. Nothing on this row reaches the
+     document, the permalink or the export. -->
+<div id="analysis">
+  <span class="sub">analysis</span>
+  <span class="group">
+    <label for="load" title="Paddler plus gear. UI state — it is never written into the boat.">load</label>
+    <input type="number" id="load" value="100" step="5" min="1" max="5000">
+    <span class="sub">kg</span>
+  </span>
+  <span class="group">
+    <label for="press" title="Operating pressure. A hand-pumped packraft runs near 0.15 psi.">pressure</label>
+    <input type="number" id="press" value="0.15" step="0.01" min="0.01" max="5">
+    <span class="sub">psi</span>
+  </span>
+  <span class="group">
+    <label title="Draw the waterline plane and tint the immersed hull."><input type="checkbox" id="wl-show" checked> waterline</label>
+  </span>
+  <span class="group">
+    <label for="cap" title="No single mitre over this, except at a tip. The corner-split rule.">max turn</label>
+    <input type="number" id="cap" value="55" step="5" min="5" max="120">
+    <span class="sub">°</span>
+    <label for="tgt" title="Target number of stored welds. 0 = only split corners over the cap.">welds</label>
+    <input type="number" id="tgt" value="0" step="1" min="0" max="24">
+    <button id="btn-suggest">suggest seams</button>
+    <button id="btn-suggest-ok" disabled>apply</button>
+    <button id="btn-suggest-no" disabled>cancel</button>
+  </span>
+  <span class="spacer"></span>
+  <span class="readout" id="flot">—</span>
+</div>
+
+<main>
+  <div id="view3d" class="pane"><span class="paneName">3D</span></div>
+  <div id="flat" class="pane"><span class="paneName">developed panels</span></div>
+  <div id="top" class="pane"></div>
+  <div id="side" class="pane"></div>
+  <div id="inspector"></div>
+</main>
+
+<footer id="footer">
+  <table id="report"><tbody></tbody></table>
+</footer>
+
+<!-- three.js, vendored as classic scripts (r147, MIT). No CDN: this must work
+     offline from file://, where ES-module imports are blocked. -->
+<script src="vendor/three.min.js"></script>
+<script src="vendor/OrbitControls.js"></script>
+
+<!-- the engine: pure, DOM-free, the identical files run under node --test -->
+<script src="engine/vec3.js"></script>
+<script src="engine/quad.js"></script>
+<script src="engine/doc.js"></script>
+<script src="engine/cone.js"></script>
+<script src="engine/loft.js"></script>
+<script src="engine/develop2.js"></script>
+<script src="engine/checks.js"></script>
+<script src="engine/ops.js"></script>
+<script src="engine/templates.js"></script>
+<script src="engine/analysis.js"></script>
+<script src="engine/export-svg.js"></script>
+<script src="engine/tile.js"></script>
+<script src="engine/encode.js"></script>
+
+<script>
+(function () {
+  'use strict';
+  var E = window.PackraftEngine;
+  var V = E.vec3, D = E.doc, DV = E.develop2, CK = E.checks, OPS = E.ops, T = E.templates;
+  var XSVG = E.exportSvg, TILE = E.tile, ENC = E.encode, AN = E.analysis;
+
+  var DEG = Math.PI / 180;
+  var COLOR = { port: 0x4a7fb5, starboard: 0x3f6d9c, span: 0xc2823c, sel: 0xe0a45c };
+  // Two build resolutions. FULL is what the gates and the flat patterns see;
+  // PREVIEW is what a pointer that has moved 3 px sees. Both are the same code
+  // -- the difference is sampling, and the gates run only on FULL, so a drag
+  // never reports a number that is an artefact of its own coarseness.
+  var BUILD = { rulings: 48, stations: 96 };
+  var PREVIEW = { rulings: 16, stations: 48, seamSamples: 16, measure: false };
+
+  // ------------------------------------------------------------------ state
+  var state = {
+    // The FIRST library entry, so the picker and the document agree at start.
+    // They did not: the picker is populated from T.names() and shows its first
+    // option, which became the kit preset, while this line still said 'diy7' --
+    // so the editor opened on one boat labelled as another, and `reset` swapped
+    // it out from under the user.
+    doc: T.template(T.names()[0]),
+    built: null, rep: null,
+    segment: null,        // selected segment id
+    weld: null,           // selected weld id
+    undo: [],             // stack of inverse descriptors
+    softRadius: 0,        // mm of centreline arclength; 0 = hard drag
+    dragging: null,       // the live gesture, or null
+    topology: null,       // the last end-topology transition, for the status line
+    error: null,          // last build failure, if any
+    // ---- ANALYSIS. All UI state: none of it is in the document, and none of
+    // it reaches the permalink or the export (see the file header).
+    loadKg: 100,          // paddler + gear
+    pressurePa: 0.15 * 6894.76,   // 0.15 psi, a hand-pumped packraft
+    showWaterline: true,
+    analysis: null,       // last observer pass, or null while a preview is stale
+    suggestion: null,     // a suggestSeams proposal awaiting confirmation
+  };
+
+  var SVGNS = 'http://www.w3.org/2000/svg';
+  function svg(tag, attrs, parent) {
+    var e = document.createElementNS(SVGNS, tag);
+    if (attrs) for (var k in attrs) if (attrs[k] != null) e.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+  function fmtN(v, dp) { return (Math.round(v * 1000) / 1000).toFixed(dp == null ? 1 : dp); }
+
+  // ==================================================================
+  // 3D view (unchanged from B2 -- it is a live preview, not an editor)
+  // ==================================================================
+  var host = document.getElementById('view3d');
+  var scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x14161a);
+  var camera = new THREE.PerspectiveCamera(42, 1, 10, 40000);
+  camera.up.set(0, 0, 1);                       // the engine is z-up (spec 2b)
+  camera.position.set(2600, -2900, 1900);
+  var renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  host.appendChild(renderer.domElement);
+  var controls = new THREE.OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.08;
+  controls.target.set(0, 0, 120);
+
+  scene.add(new THREE.HemisphereLight(0xcfe4ff, 0x2a2f38, 1.15));
+  var key = new THREE.DirectionalLight(0xffffff, 1.5);
+  key.position.set(1800, -2200, 2600); scene.add(key);
+  var fill = new THREE.DirectionalLight(0xffffff, 0.5);
+  fill.position.set(-2000, 1600, 900); scene.add(fill);
+  var grid = new THREE.GridHelper(6000, 24, 0x39414d, 0x262c35);
+  grid.rotation.x = Math.PI / 2; scene.add(grid);
+
+  var boat = new THREE.Group(); scene.add(boat);
+  var materials = {};
+  Object.keys(COLOR).forEach(function (role) {
+    materials[role] = new THREE.MeshStandardMaterial({
+      color: COLOR[role], roughness: 0.62, metalness: 0.04,
+      side: THREE.DoubleSide, flatShading: false
+    });
+  });
+  var seamMat = new THREE.LineBasicMaterial({ color: 0x11151a });
+  var landMat = new THREE.LineBasicMaterial({ color: 0xe8b56b });
+  var weldMat = new THREE.LineBasicMaterial({ color: 0xffd79a });
+
+  /**
+   * THE WATERLINE, drawn the only way that cannot lie: by CLIPPING.
+   *
+   * The immersed hull is the SAME geometry drawn a second time in a wet colour
+   * through a clipping plane at z = waterline, so what is tinted is exactly
+   * what the flotation integral called immersed -- there is no second mesh, no
+   * "below the waterline" copy that could drift from the number in the readout.
+   * The plane object is mutated in place as the load changes; the materials
+   * hold a reference to it, so nothing has to be rebuilt to move the water.
+   *
+   * `polygonOffset` because the wet copy is coincident with the dry one and
+   * z-fighting between two shades of the same hull is exactly as ugly as it
+   * sounds.
+   */
+  renderer.localClippingEnabled = true;
+  var clipPlane = new THREE.Plane(new THREE.Vector3(0, 0, -1), 0);
+  var wetMaterials = {};
+  Object.keys(COLOR).forEach(function (role) {
+    // ONE wet colour for every role. The point of the tint is "this is under
+    // water", not "this is a port panel", and re-tinting each role would put
+    // the panel palette in competition with the only thing the tint is for.
+    wetMaterials[role] = new THREE.MeshStandardMaterial({
+      color: 0x18a892, roughness: 0.42, metalness: 0.05,
+      side: THREE.DoubleSide, clippingPlanes: [clipPlane],
+      polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2,
+    });
+  });
+  var waterMat = new THREE.MeshBasicMaterial({
+    color: 0x5aa9d6, transparent: true, opacity: 0.11,
+    side: THREE.DoubleSide, depthWrite: false,
+  });
+  var waterEdgeMat = new THREE.LineBasicMaterial({ color: 0x7fc7ec });
+
+  var pickable = [];
+  function clear3d() {
+    for (var i = boat.children.length - 1; i >= 0; i--) {
+      var c = boat.children[i];
+      boat.remove(c);
+      if (c.geometry) c.geometry.dispose();
+    }
+    pickable = [];
+  }
+
+  // The strip between the two ends of each RULING. startEdge3D[i] and
+  // endEdge3D[i] are the two ends of ruling i (the panel contract in
+  // develop2.js), so this strip IS the developable surface, not a subdivision
+  // approximation of it -- and it cannot disagree with the flat pattern,
+  // because there is only one geometry.
+  function stripGeometry(panel) {
+    var A = panel.startEdge3D, B = panel.endEdge3D, n = A.length;
+    var pos = new Float32Array(n * 2 * 3);
+    for (var i = 0; i < n; i++) {
+      pos[i * 6] = A[i][0]; pos[i * 6 + 1] = A[i][1]; pos[i * 6 + 2] = A[i][2];
+      pos[i * 6 + 3] = B[i][0]; pos[i * 6 + 4] = B[i][1]; pos[i * 6 + 5] = B[i][2];
+    }
+    var idx = [];
+    for (var k = 0; k < n - 1; k++) {
+      var a = k * 2, b = a + 1, c = a + 2, d = a + 3;
+      idx.push(a, b, d, a, d, c);
+    }
+    var g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    g.setIndex(idx);
+    g.computeVertexNormals();
+    return g;
+  }
+
+  function lineGeometry(pts) {
+    var pos = new Float32Array(pts.length * 3);
+    for (var i = 0; i < pts.length; i++) {
+      pos[i * 3] = pts[i][0]; pos[i * 3 + 1] = pts[i][1]; pos[i * 3 + 2] = pts[i][2];
+    }
+    var g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    return g;
+  }
+
+  /** The weld's own curve, sampled -- the ring a section reads as. */
+  function weldRing(w, n) {
+    var fr = D.weldFrame(w), pts = [], N = n || 96;
+    for (var i = 0; i <= N; i++) pts.push(D.weldPoint(w, 2 * Math.PI * i / N, fr));
+    return pts;
+  }
+
+  function set3d(built) {
+    clear3d();
+    built.panels.forEach(function (p) {
+      var mat = (p.id === state.segment || p.mirrorOf === state.segment)
+        ? materials.sel : (materials[p.role] || materials.port);
+      var mesh = new THREE.Mesh(stripGeometry(p), mat);
+      mesh.userData.panel = p;
+      boat.add(mesh);
+      pickable.push(mesh);
+      boat.add(new THREE.Line(lineGeometry(p.edgeA3D), seamMat));
+    });
+    boat.add(new THREE.Line(lineGeometry(built.floor.landing3D.slice()), landMat));
+    addWaterline(built);
+    var w = selectedWeld();
+    if (w) {
+      boat.add(new THREE.Line(lineGeometry(weldRing(w)), weldMat));
+      if (state.doc.mirror && !w.onCentreplane) {
+        boat.add(new THREE.Line(lineGeometry(weldRing(D.mirrorWeld(w))), weldMat));
+      }
+    }
+  }
+
+  /**
+   * The water surface, and the wet copy of the hull under it.
+   *
+   * Drawn from the last FULL analysis pass only. During a drag the observers do
+   * not run (they read the same integrals the gates do, and a pointer move is
+   * not the moment for either), so the waterline simply is not drawn rather
+   * than being drawn at a stale height on a boat that has changed shape.
+   */
+  function addWaterline(built) {
+    if (!state.showWaterline || !state.analysis) return;
+    var f = state.analysis.flotation;
+    if (f.waterline == null) return;
+    clipPlane.constant = f.waterline;
+    built.panels.forEach(function (p) {
+      var mesh = new THREE.Mesh(stripGeometry(p), wetMaterials[p.role] || wetMaterials.port);
+      boat.add(mesh);                       // NOT pickable: it is a tint, not a part
+    });
+    var b = f.model.bounds;
+    var padX = 0.12 * (b.xMax - b.xMin), padY = 900;
+    var yMax = 0;
+    built.panels.forEach(function (p) {
+      p.startEdge3D.forEach(function (q) { yMax = Math.max(yMax, Math.abs(q[1])); });
+    });
+    var g = new THREE.PlaneGeometry((b.xMax - b.xMin) + 2 * padX, 2 * yMax + padY);
+    var plane = new THREE.Mesh(g, waterMat);
+    plane.position.set((b.xMin + b.xMax) / 2, 0, f.waterline);
+    boat.add(plane);
+    // The waterline ON the hull, as the intersection curve would draw it: one
+    // ring at the plane's height round the boat's own extent, so the eye can
+    // read the draft against the tube even from directly above.
+    var x0 = b.xMin - padX, x1 = b.xMax + padX, y1 = yMax + padY / 2;
+    boat.add(new THREE.Line(lineGeometry([
+      [x0, -y1, f.waterline], [x1, -y1, f.waterline],
+      [x1, y1, f.waterline], [x0, y1, f.waterline], [x0, -y1, f.waterline],
+    ]), waterEdgeMat));
+  }
+
+  function resize3d() {
+    var w = host.clientWidth, h = host.clientHeight;
+    if (!w || !h) return;
+    renderer.setSize(w, h, false);
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+  }
+  (function loop() {
+    requestAnimationFrame(loop);
+    controls.update();
+    renderer.render(scene, camera);
+  })();
+
+  // --- picking. A click that did not drag the orbit controls is a selection.
+  var raycaster = new THREE.Raycaster();
+  var downAt = null;
+  renderer.domElement.addEventListener('pointerdown', function (e) {
+    downAt = [e.clientX, e.clientY];
+  });
+  renderer.domElement.addEventListener('pointerup', function (e) {
+    if (!downAt) return;
+    var moved = Math.abs(e.clientX - downAt[0]) + Math.abs(e.clientY - downAt[1]);
+    downAt = null;
+    if (moved > 4) return;                       // that was an orbit, not a click
+    var r = renderer.domElement.getBoundingClientRect();
+    raycaster.setFromCamera(new THREE.Vector2(
+      ((e.clientX - r.left) / r.width) * 2 - 1,
+      -((e.clientY - r.top) / r.height) * 2 + 1), camera);
+    var hit = raycaster.intersectObjects(pickable, false)[0];
+    if (hit) selectPanel(hit.object.userData.panel);
+  });
+
+  // ==================================================================
+  // THE ORTHOGRAPHIC PANES -- B3's actual deliverable
+  // ==================================================================
+  /**
+   * One pane is a parallel projection of the world onto two axes, drawn in CSS
+   * PIXELS (not in a scaled viewBox), so a handle is 6 px whatever the zoom and
+   * hit-testing needs no inverse of a viewBox transform.
+   *
+   *   pane u = hs * world[hi]   -> screen x
+   *   pane v = vs * world[vi]   -> screen y (SVG y runs DOWN, hence the signs)
+   *
+   *   TOP  looks down  +z: x to the right, PORT (+y) up   -> vs = -1 on y
+   *   SIDE looks from starboard: x to the right, UP (+z) up -> vs = -1 on z
+   *
+   * `viewAxis` is the world direction OUT of the screen toward the viewer:
+   * rotating a vector about it by d increases its on-screen angle by d, which
+   * is exactly what a normal-handle drag needs and the only place the panes
+   * touch 3-D rotation.
+   */
+  function makePane(id, spec) {
+    var el = document.getElementById(id);
+    var pane = {
+      id: id, host: el, name: spec.name,
+      hi: spec.hi, hs: spec.hs, vi: spec.vi, vs: spec.vs,
+      viewAxis: spec.viewAxis, third: spec.third,
+      scale: 0.25, origin: [0, 0], fitted: false,
+      underlay: { url: null, img: null, mmPerPx: 1, u: 0, v: 0, opacity: 0.5,
+                  adjust: false, w: 0, h: 0 },
+      layers: {},
+    };
+    var s = svg('svg', { xmlns: SVGNS }, el);
+    pane.svg = s;
+    pane.layers.under = svg('g', null, s);
+    pane.layers.grid = svg('g', null, s);
+    pane.layers.hull = svg('g', null, s);
+    pane.layers.line = svg('g', null, s);
+    pane.layers.handles = svg('g', null, s);
+    var nm = document.createElement('span');
+    nm.className = 'paneName'; nm.textContent = spec.name;
+    el.appendChild(nm);
+    var hint = document.createElement('span');
+    hint.className = 'hint'; hint.textContent = spec.hint;
+    el.appendChild(hint);
+    el.appendChild(underlayBar(pane));
+    bindPane(pane);
+    return pane;
+  }
+
+  /** world 3-vector -> [x, y] in pane pixels. */
+  function toScreen(pane, p) {
+    return [pane.origin[0] + pane.scale * pane.hs * p[pane.hi],
+            pane.origin[1] + pane.scale * pane.vs * p[pane.vi]];
+  }
+  /** pane pixels -> the two world components this pane can see. */
+  function toWorld2(pane, x, y) {
+    return [pane.hs * (x - pane.origin[0]) / pane.scale,
+            pane.vs * (y - pane.origin[1]) / pane.scale];
+  }
+  /** A pane point as a full world point, keeping the invisible axis from `base`. */
+  function toWorld3(pane, x, y, base) {
+    var uv = toWorld2(pane, x, y);
+    var p = base.slice();
+    p[pane.hi] = uv[0];
+    p[pane.vi] = uv[1];
+    return p;
+  }
+  function localXY(pane, e) {
+    var r = pane.svg.getBoundingClientRect();
+    return [e.clientX - r.left, e.clientY - r.top];
+  }
+  /** The inverse of toScreen, in CLIENT coordinates -- what a test drives. */
+  function clientAt(pane, p) {
+    var r = pane.svg.getBoundingClientRect();
+    var s = toScreen(pane, p);
+    return { x: r.left + s[0], y: r.top + s[1] };
+  }
+
+  var PANES = {};
+  PANES.top = makePane('top', {
+    name: 'top — plan', hi: 0, hs: 1, vi: 1, vs: -1, third: 2,
+    viewAxis: [0, 0, 1],
+    hint: 'drag dots = plan position · edge handle = width a · arrow = heading · ring = roll',
+  });
+  PANES.side = makePane('side', {
+    name: 'side — profile', hi: 0, hs: 1, vi: 2, vs: -1, third: 1,
+    viewAxis: [0, -1, 0],
+    hint: 'drag dots = height · top handle = height b · arrow = rake · shift locks the axis',
+  });
+
+  // ------------------------------------------------------- photo underlay
+  /**
+   * A reference photo, in the pane, behind everything.
+   *
+   * Loaded from a LOCAL FILE through an object URL: no network, nothing
+   * uploaded, and the page still works from file://. The transform lives in
+   * pane.underlay and NOWHERE ELSE -- the plan is explicit that it must not go
+   * into the boat document (it is a property of this session, not of the
+   * design, and a permalink carrying a stranger's photo offsets would be a
+   * bug). Reloading the page loses it, by design.
+   *
+   * Scale is MILLIMETRES PER PIXEL, typed, because that is the number a person
+   * actually has: photograph a boat with a metre rule in shot, divide.
+   */
+  function underlayBar(pane) {
+    var bar = document.createElement('div');
+    bar.className = 'paneBar';
+    var file = document.createElement('input');
+    file.type = 'file'; file.accept = 'image/*'; file.title = 'reference photo (local file)';
+    var op = document.createElement('input');
+    op.type = 'range'; op.min = 0; op.max = 1; op.step = 0.02; op.value = 0.5;
+    op.title = 'underlay opacity';
+    var mm = document.createElement('input');
+    mm.type = 'number'; mm.step = 0.1; mm.value = 1; mm.title = 'mm per image pixel';
+    var adj = document.createElement('input');
+    adj.type = 'checkbox'; adj.title = 'drag/scroll the pane to move and scale the photo';
+    var lab = document.createElement('label');
+    lab.appendChild(adj); lab.appendChild(document.createTextNode(' place'));
+
+    file.addEventListener('change', function () {
+      var f = file.files && file.files[0];
+      if (!f) return;
+      if (pane.underlay.url) URL.revokeObjectURL(pane.underlay.url);
+      pane.underlay.url = URL.createObjectURL(f);
+      var img = new Image();
+      img.onload = function () {
+        pane.underlay.img = img;
+        pane.underlay.w = img.naturalWidth;
+        pane.underlay.h = img.naturalHeight;
+        // Land it centred on the view the first time, so it is never off-screen.
+        var c = toWorld2(pane, pane.host.clientWidth / 2, pane.host.clientHeight / 2);
+        pane.underlay.mmPerPx = Math.max(0.01,
+          (2400 / Math.max(1, img.naturalWidth)));
+        mm.value = fmtN(pane.underlay.mmPerPx, 3);
+        pane.underlay.u = pane.hs * c[0] - pane.underlay.mmPerPx * img.naturalWidth / 2;
+        pane.underlay.v = pane.vs * c[1] - pane.underlay.mmPerPx * img.naturalHeight / 2;
+        adj.checked = true; pane.underlay.adjust = true;
+        drawPane(pane);
+      };
+      img.src = pane.underlay.url;
+    });
+    op.addEventListener('input', function () {
+      pane.underlay.opacity = +op.value; drawPane(pane);
+    });
+    mm.addEventListener('input', function () {
+      pane.underlay.mmPerPx = Math.max(1e-4, +mm.value || 1e-4); drawPane(pane);
+    });
+    adj.addEventListener('change', function () { pane.underlay.adjust = adj.checked; });
+    pane.underlayInputs = { file: file, op: op, mm: mm, adj: adj };
+
+    bar.appendChild(file); bar.appendChild(op); bar.appendChild(mm); bar.appendChild(lab);
+    return bar;
+  }
+
+  function drawUnderlay(pane) {
+    var g = pane.layers.under;
+    g.textContent = '';
+    var u = pane.underlay;
+    if (!u.img) return;
+    // The underlay lives in PANE MILLIMETRES (u, v), so it stays put under the
+    // boat when the view is panned or zoomed -- which is the whole point of
+    // tracing over it.
+    var x = pane.origin[0] + pane.scale * u.u;
+    var y = pane.origin[1] + pane.scale * u.v;
+    var im = svg('image', {
+      x: x, y: y,
+      width: pane.scale * u.mmPerPx * u.w,
+      height: pane.scale * u.mmPerPx * u.h,
+      opacity: u.opacity, preserveAspectRatio: 'none',
+    }, g);
+    im.setAttributeNS('http://www.w3.org/1999/xlink', 'href', u.url);
+    im.setAttribute('href', u.url);
+  }
+
+  // ------------------------------------------------------------- pane draw
+  var HANDLE_R = 5.5;
+
+  function paneWeldColor(w, weight) {
+    if (w.id === state.weld) return '#f0b269';
+    if (weight > 0) return 'rgb(' + Math.round(90 + 120 * weight) + ','
+      + Math.round(120 + 60 * weight) + ',' + Math.round(170 + 20 * weight) + ')';
+    return '#7f93ad';
+  }
+
+  function drawPane(pane) {
+    var w = pane.host.clientWidth, h = pane.host.clientHeight;
+    if (!w || !h) return;
+    pane.svg.setAttribute('viewBox', '0 0 ' + w + ' ' + h);
+    if (!pane.fitted && state.built) fitPane(pane, state.built);
+    drawUnderlay(pane);
+
+    // --- axes: the MIRROR LINE in plan, the datum in profile.
+    var g = pane.layers.grid;
+    g.textContent = '';
+    var zero = toScreen(pane, [0, 0, 0]);
+    svg('path', {
+      d: 'M0 ' + zero[1] + 'H' + w, stroke: '#38424f', 'stroke-width': 1,
+      'stroke-dasharray': pane.id === 'top' ? '10 6' : '3 5', fill: 'none',
+    }, g);
+    svg('text', { x: 6, y: zero[1] - 4, fill: '#4d5867', 'font-size': 10 }, g)
+      .textContent = pane.id === 'top' ? 'centreplane (mirror line)' : 'z = 0 datum';
+    svg('path', { d: 'M' + zero[0] + ' 0V' + h, stroke: '#2b333d', 'stroke-width': 1,
+      'stroke-dasharray': '3 6', fill: 'none' }, g);
+
+    // THE SNAP BAND. End topology is where the dot sits (plan v4), and the only
+    // thing that makes that discoverable rather than mysterious is SEEING the
+    // capture radius: inside this band the end weld lands ON the mirror line and
+    // the boat gets a pointed tip; outside it, the ring closes through a bridge
+    // span. Drawn only for an END weld, because only an end weld has a topology
+    // to switch.
+    var selIdx = D.byId(state.doc, state.weld);
+    if (pane.id === 'top' && state.doc.mirror && selIdx >= 0
+        && (selIdx === 0 || selIdx === state.doc.welds.length - 1)) {
+      var y0 = toScreen(pane, [0, OPS.SNAP_MM, 0])[1];
+      var y1 = toScreen(pane, [0, -OPS.SNAP_MM, 0])[1];
+      svg('rect', { x: 0, y: Math.min(y0, y1), width: w, height: Math.abs(y1 - y0) + 1,
+        fill: 'rgba(232,181,107,.16)', stroke: 'rgba(232,181,107,.45)',
+        'stroke-width': 0.8, 'pointer-events': 'none' }, g);
+      svg('text', { x: w - 8, y: Math.min(y0, y1) - 5, fill: '#a3855c', 'font-size': 10,
+        'text-anchor': 'end' }, g)
+        .textContent = 'snap: inside \u00b1' + OPS.SNAP_MM + ' mm the end is a POINTED tip';
+    }
+
+    // --- the derived hull, as the projection of the built segments.
+    var hull = pane.layers.hull;
+    hull.textContent = '';
+    if (state.built) {
+      // THE SILHOUETTE, as the UNION of the projected ruling quads.
+      //
+      // Not the panel's boundary polygon: a segment wraps the WHOLE tube, so
+      // its boundary traces weld A's closed curve and then weld B's, and the
+      // two windings cancel wherever they overlap -- which is most of the boat,
+      // and it shows as a hollow hull with only the ends filled. Filling quad
+      // by quad is the projection of the actual surface. Each quad is emitted
+      // with a consistent (positive) winding so the nonzero fill rule unions
+      // them instead of punching holes, and the whole panel is ONE path element
+      // inside a group whose opacity is set once -- overlapping quads inside a
+      // group with group-opacity composite as a single layer, so a doubly
+      // covered patch is not twice as dark.
+      var layers = { port: [], starboard: [], span: [], sel: [] };
+      state.built.panels.forEach(function (p) {
+        // In profile the starboard panels project exactly onto their port
+        // sources, so drawing them again would only double the ink.
+        if (p.role === 'starboard' && pane.id === 'side') return;
+        var sel = (p.id === state.segment || p.mirrorOf === state.segment);
+        var bucket = layers[sel ? 'sel' : p.role] || layers.port;
+        var A = p.startEdge3D, B = p.endEdge3D;
+        for (var i = 0; i < A.length - 1; i++) {
+          bucket.push(quadD(pane, A[i], B[i], B[i + 1], A[i + 1]));
+        }
+      });
+      var FILL = { port: ['rgba(74,127,181,1)', 0.20], starboard: ['rgba(74,127,181,1)', 0.10],
+        span: ['rgba(194,130,60,1)', 0.20], sel: ['rgba(224,164,92,1)', 0.28] };
+      Object.keys(layers).forEach(function (k) {
+        if (!layers[k].length) return;
+        var g2 = svg('g', { opacity: FILL[k][1], 'pointer-events': 'none' }, hull);
+        svg('path', { d: layers[k].join(''), fill: FILL[k][0], stroke: 'none',
+          'fill-rule': 'nonzero' }, g2);
+      });
+      // Every derived weld ring, so the SECTIONS are visible as sections.
+      state.built.ring.welds.forEach(function (rw) {
+        svg('path', {
+          d: polyD(pane, weldRing(rw.weld, 48), true),
+          fill: 'none',
+          stroke: rw.sourceId === state.weld ? '#f0b269' : 'rgba(120,150,185,.35)',
+          'stroke-width': rw.sourceId === state.weld ? 1.6 : 1,
+          'pointer-events': 'none',
+        }, hull);
+      });
+    }
+
+    // --- THE LINE: the polyline through the stored weld centres, and (in plan)
+    // its mirror. This is the designer's model made literal (plan v4).
+    var line = pane.layers.line;
+    line.textContent = '';
+    var centres = state.doc.welds.map(function (x) { return x.c; });
+    svg('path', { d: polyD(pane, centres, false), fill: 'none', stroke: '#9fb4cc',
+      'stroke-width': 1.6, 'pointer-events': 'none' }, line);
+    if (state.doc.mirror && pane.id === 'top') {
+      svg('path', { d: polyD(pane, centres.map(V.mirrorY), false), fill: 'none',
+        stroke: 'rgba(159,180,204,.35)', 'stroke-width': 1.2,
+        'stroke-dasharray': '6 4', 'pointer-events': 'none' }, line);
+    }
+
+    drawGhosts(pane);
+    drawHandles(pane);
+  }
+
+  /**
+   * The suggest-seams preview: where the welds WOULD go.
+   *
+   * Ghost dots and a dashed line through them, drawn over the real boat, in the
+   * same panes the real dots live in so the comparison is direct. Nothing has
+   * been applied at this point -- `state.suggestion` is a proposal object, and
+   * the document underneath it is untouched until "apply" is pressed.
+   */
+  function drawGhosts(pane) {
+    var g = pane.layers.line;
+    var s = state.suggestion;
+    if (!s) return;
+    var pts = s.stations.map(function (x) { return x.c; });
+    svg('path', { d: polyD(pane, pts, false), fill: 'none', stroke: '#5ad6a8',
+      'stroke-width': 1.4, 'stroke-dasharray': '7 5', 'pointer-events': 'none' }, g);
+    if (state.doc.mirror && pane.id === 'top') {
+      svg('path', { d: polyD(pane, pts.map(V.mirrorY), false), fill: 'none',
+        stroke: 'rgba(90,214,168,.4)', 'stroke-width': 1.1,
+        'stroke-dasharray': '7 5', 'pointer-events': 'none' }, g);
+    }
+    s.stations.forEach(function (st) {
+      var p = toScreen(pane, st.c);
+      svg('circle', { cx: p[0], cy: p[1], r: st.kind === 'keep' ? 4 : 6,
+        fill: st.kind === 'insert' ? 'rgba(90,214,168,.85)' : 'none',
+        stroke: '#5ad6a8', 'stroke-width': 2, 'pointer-events': 'none' }, g);
+      if (st.kind !== 'keep') {
+        svg('text', { x: p[0] + 8, y: p[1] + 14, fill: '#5ad6a8', 'font-size': 10,
+          'pointer-events': 'none' }, g)
+          .textContent = st.turnDeg.toFixed(0) + '°';
+      }
+    });
+  }
+
+  /** One projected quad, wound positive so `fill-rule: nonzero` unions them. */
+  function quadD(pane, a, b, c, d) {
+    var p = [toScreen(pane, a), toScreen(pane, b), toScreen(pane, c), toScreen(pane, d)];
+    var area = 0;
+    for (var i = 0; i < 4; i++) {
+      var q = p[i], r = p[(i + 1) % 4];
+      area += q[0] * r[1] - r[0] * q[1];
+    }
+    if (area < 0) p.reverse();
+    return 'M' + p[0][0].toFixed(1) + ' ' + p[0][1].toFixed(1)
+      + 'L' + p[1][0].toFixed(1) + ' ' + p[1][1].toFixed(1)
+      + 'L' + p[2][0].toFixed(1) + ' ' + p[2][1].toFixed(1)
+      + 'L' + p[3][0].toFixed(1) + ' ' + p[3][1].toFixed(1) + 'Z';
+  }
+
+  function polyD(pane, pts, close) {
+    var d = '';
+    for (var i = 0; i < pts.length; i++) {
+      var s = toScreen(pane, pts[i]);
+      d += (i ? 'L' : 'M') + s[0].toFixed(2) + ' ' + s[1].toFixed(2);
+    }
+    return close ? d + 'Z' : d;
+  }
+
+  /**
+   * The dots, and the selected dot's handles.
+   *
+   * WHY ROLL IS A RATE GRIP AND NOT A GEOMETRIC DRAG. `a`, `b`, the centre and
+   * the normal all have honest ortho handles: their directions project onto the
+   * pane with something to grab. `roll` does not. It rotates the (a, b) axes
+   * INSIDE the weld plane, and a weld plane on any ordinary boat is close to
+   * athwartships -- i.e. nearly EDGE-ON in both the top and the side view. The
+   * weld curve projects to something close to a line segment, so the map from
+   * pointer angle to in-plane angle is ill-conditioned exactly where the handle
+   * would be. So roll gets a grip that reads pointer TRAVEL, not pointer
+   * position, at a fixed degrees-per-pixel -- and the numeric field beside it is
+   * the precision instrument, which is what typed entry is for.
+   */
+  function drawHandles(pane) {
+    var g = pane.layers.handles;
+    g.textContent = '';
+    var weights = null;
+    if (state.weld != null && state.softRadius > 0
+        && D.byId(state.doc, state.weld) >= 0) {
+      weights = OPS.moldWeights(state.doc, state.weld, state.softRadius);
+    }
+
+    state.doc.welds.forEach(function (w, i) {
+      var s = toScreen(pane, w.c);
+      var weight = weights ? weights[i].weight : 0;
+      var dot = svg('circle', {
+        cx: s[0], cy: s[1], r: w.id === state.weld ? HANDLE_R + 1.5 : HANDLE_R,
+        fill: paneWeldColor(w, weight),
+        stroke: w.onCentreplane ? '#e8b56b' : '#101216',
+        'stroke-width': w.onCentreplane ? 2 : 1.5,
+        cursor: 'move',
+      }, g);
+      dot.dataset.handle = 'centre';
+      dot.dataset.weld = w.id;
+      svg('text', { x: s[0] + 9, y: s[1] - 8, fill: '#67788c', 'font-size': 10,
+        'pointer-events': 'none' }, g).textContent = 'W' + w.id
+          + (weight > 0 && w.id !== state.weld ? ' ' + Math.round(weight * 100) + '%' : '');
+    });
+
+    var w = selectedWeld();
+    if (!w) return;
+    var c = toScreen(pane, w.c);
+    var fr = D.weldFrame(w);
+
+    // AN AXIS SEEN EDGE-ON HAS NO HANDLE. A direction whose projection into this
+    // pane is shorter than the handle itself cannot be dragged in it -- the
+    // pointer has no room to say anything -- and drawing one anyway does real
+    // damage: it lands ON the centre dot and steals the drag. That is exactly
+    // what a pointed tip does in profile, where the weld normal is athwartships
+    // and projects to nothing, so the tip's own dot became undraggable. The
+    // numeric field is the handle for these; the pane declines to pretend.
+    var VISIBLE_PX = 9;
+    var withHandle = function (offset, kind, colour, shape, tip) {
+      var ts = toScreen(pane, V.add(w.c, offset));
+      if (Math.hypot(ts[0] - c[0], ts[1] - c[1]) < VISIBLE_PX) return null;
+      svg('path', { d: 'M' + c[0] + ' ' + c[1] + 'L' + ts[0] + ' ' + ts[1],
+        stroke: colour, 'stroke-width': 1.3,
+        'stroke-dasharray': shape === 'rect' ? '4 3' : null,
+        fill: 'none', 'pointer-events': 'none' }, g);
+      var el = shape === 'rect'
+        ? svg('rect', { x: ts[0] - 5, y: ts[1] - 5, width: 10, height: 10,
+            fill: colour, stroke: '#101216', 'stroke-width': 1.2, cursor: 'crosshair' }, g)
+        : svg('circle', { cx: ts[0], cy: ts[1], r: 5, fill: colour,
+            stroke: '#101216', 'stroke-width': 1.2, cursor: 'crosshair' }, g);
+      el.dataset.handle = kind;
+      el.dataset.weld = w.id;
+      svg('title', null, el).textContent = tip;
+      return el;
+    };
+
+    // --- the section axis handle: `a` in plan (the outboard edge of the dot),
+    // `b` in profile (its top edge). Both are the weld's own axes, projected.
+    var axisKey = pane.id === 'top' ? 'a' : 'b';
+    var axisVec = pane.id === 'top' ? fr.e1 : fr.e2;
+    withHandle(V.scale(axisVec, w[axisKey]), axisKey, '#e0a45c', 'rect',
+      axisKey === 'a'
+        ? 'semi-axis a = ' + fmtN(w.a) + ' mm (along the weld\'s own rolled e1 axis)'
+        : 'semi-axis b = ' + fmtN(w.b) + ' mm'
+          + (state.doc.locks.uniformB ? ' — uniform-b lock: this edits EVERY weld' : ''));
+
+    // --- the plane-normal handle: heading in plan, RAKE in profile.
+    var nLen = Math.max(70, 0.75 * Math.max(w.a, w.b));
+    withHandle(V.scale(w.n, nLen), 'normal', '#6fbf73', 'circle', pane.id === 'side'
+      ? 'rake ' + fmtN(OPS.rakeOf(w) / DEG) + '° (elevation of the weld normal)'
+      : 'plan-view heading of the weld plane');
+
+    // --- the roll grip (top pane only; see the note above this function).
+    if (pane.id === 'top') {
+      // A FILLED ring: `fill: none` would leave only the 2 px stroke hit-testable
+      // (SVG's default pointer-events is `visiblePainted`), and a 2 px target is
+      // not a handle, it is a dare.
+      var rh = svg('circle', { cx: c[0] - 20, cy: c[1] - 20, r: 6,
+        fill: '#2b2438', stroke: '#b98ad6', 'stroke-width': 2, cursor: 'ew-resize' }, g);
+      rh.dataset.handle = 'roll';
+      rh.dataset.weld = w.id;
+      svg('title', null, rh).textContent = 'roll ' + fmtN(w.roll / DEG)
+        + '° — drag sideways (0.25°/px); type the number for precision';
+    }
+  }
+
+  function fitPane(pane, built) {
+    var w = pane.host.clientWidth, h = pane.host.clientHeight;
+    if (!w || !h) return;
+    var u0 = Infinity, u1 = -Infinity, v0 = Infinity, v1 = -Infinity;
+    var pts = [];
+    built.panels.forEach(function (p) {
+      for (var i = 0; i < p.startEdge3D.length; i += 2) {
+        pts.push(p.startEdge3D[i]); pts.push(p.endEdge3D[i]);
+      }
+    });
+    if (!pts.length) return;
+    pts.forEach(function (p) {
+      var u = pane.hs * p[pane.hi], v = pane.vs * p[pane.vi];
+      if (u < u0) u0 = u; if (u > u1) u1 = u;
+      if (v < v0) v0 = v; if (v > v1) v1 = v;
+    });
+    var pad = 34;
+    var s = Math.min((w - 2 * pad) / Math.max(1, u1 - u0),
+      (h - 2 * pad) / Math.max(1, v1 - v0));
+    pane.scale = s;
+    pane.origin = [w / 2 - s * (u0 + u1) / 2, h / 2 - s * (v0 + v1) / 2];
+    pane.fitted = true;
+  }
+
+  // ==================================================================
+  // Pane interaction: every gesture ends in an op
+  // ==================================================================
+  /**
+   * ONE GESTURE IS ONE UNDO STEP.
+   *
+   * Each pointer move re-applies the op to `base` -- the document as it was when
+   * the gesture STARTED -- rather than to the document the previous move
+   * produced. Three things fall out, and all three matter:
+   *
+   *   1. a 200-event drag leaves ONE entry on the undo stack, not 200;
+   *   2. the end-topology snap stays reversible, because the op is a function of
+   *      the pointer POSITION and not of the path it took to get there;
+   *   3. a locked setHeight does not compound (each move sets b, it does not
+   *      add to it).
+   *
+   * The last op's inverse is pushed on pointerup, and only if anything moved.
+   */
+  function bindPane(pane) {
+    pane.svg.addEventListener('pointerdown', function (e) {
+      var t = e.target;
+      var kind = t && t.dataset ? t.dataset.handle : null;
+      pane.svg.setPointerCapture(e.pointerId);
+      var xy = localXY(pane, e);
+      if (kind) {
+        var id = +t.dataset.weld;
+        if (id !== state.weld) { state.weld = id; syncSelection(); }
+        state.dragging = {
+          pane: pane, kind: kind, id: id, from: xy, base: state.doc,
+          baseWeld: D.clone(state.doc.welds[D.byId(state.doc, id)]),
+          last: null, moved: false,
+        };
+      } else if (pane.underlay.adjust && pane.underlay.img) {
+        state.dragging = { pane: pane, kind: 'photo', from: xy,
+          base0: [pane.underlay.u, pane.underlay.v] };
+      } else {
+        state.dragging = { pane: pane, kind: 'pan', from: xy,
+          base0: pane.origin.slice() };
+      }
+      e.preventDefault();
+    });
+
+    pane.svg.addEventListener('pointermove', function (e) {
+      var d = state.dragging;
+      if (!d || d.pane !== pane) return;
+      d.at = localXY(pane, e);
+      d.shift = e.shiftKey;
+      requestPaint();
+    });
+
+    var end = function (e) {
+      var d = state.dragging;
+      if (!d || d.pane !== pane) return;
+      if (d.at) { applyDrag(d, true); }
+      state.dragging = null;
+      if (d.last && d.moved) {
+        state.undo.push(d.last.inverse);
+        regenerate();                       // full resolution + the gates
+      } else if (d.kind === 'pan' || d.kind === 'photo') {
+        drawPane(pane);
+      } else {
+        syncSelection();          // a click that selected but did not move
+      }
+      try { pane.svg.releasePointerCapture(e.pointerId); } catch (err) { /* gone */ }
+    };
+    pane.svg.addEventListener('pointerup', end);
+    pane.svg.addEventListener('pointercancel', end);
+
+    // Wheel: zoom the view about the cursor, or scale the photo about it.
+    pane.svg.addEventListener('wheel', function (e) {
+      e.preventDefault();
+      var xy = localXY(pane, e);
+      var k = Math.exp(-e.deltaY * 0.0015);
+      if (pane.underlay.adjust && pane.underlay.img) {
+        var uv = toWorld2(pane, xy[0], xy[1]);
+        var pu = pane.hs * uv[0], pv = pane.vs * uv[1];
+        pane.underlay.u = pu + (pane.underlay.u - pu) * k;
+        pane.underlay.v = pv + (pane.underlay.v - pv) * k;
+        pane.underlay.mmPerPx *= k;
+        if (pane.underlayInputs) pane.underlayInputs.mm.value = fmtN(pane.underlay.mmPerPx, 3);
+      } else {
+        pane.origin[0] = xy[0] + (pane.origin[0] - xy[0]) * k;
+        pane.origin[1] = xy[1] + (pane.origin[1] - xy[1]) * k;
+        pane.scale *= k;
+      }
+      drawPane(pane);
+    }, { passive: false });
+  }
+
+  var paintQueued = false;
+  function requestPaint() {
+    if (paintQueued) return;
+    paintQueued = true;
+    requestAnimationFrame(function () {
+      paintQueued = false;
+      if (state.dragging && state.dragging.at) applyDrag(state.dragging, false);
+    });
+  }
+
+  /**
+   * Turn the live pointer position into an op (or into a view/photo transform),
+   * and rebuild. `final` asks for nothing extra here -- the FULL rebuild happens
+   * in the pointerup handler, so the drag itself always runs at preview
+   * resolution and never stutters into the gate integrals.
+   */
+  function applyDrag(d, final) {
+    var pane = d.pane, xy = d.at;
+    if (!xy) return;
+    if (d.kind === 'pan') {
+      pane.origin = [d.base0[0] + (xy[0] - d.from[0]), d.base0[1] + (xy[1] - d.from[1])];
+      drawPane(pane);
+      return;
+    }
+    if (d.kind === 'photo') {
+      pane.underlay.u = d.base0[0] + (xy[0] - d.from[0]) / pane.scale;
+      pane.underlay.v = d.base0[1] + (xy[1] - d.from[1]) / pane.scale;
+      drawPane(pane);
+      return;
+    }
+
+    var base = d.base, w = d.baseWeld, r = null;
+    if (d.kind === 'profile') {
+      r = profileDrag(d);
+      if (!r) return;
+      d.last = r; d.moved = true;
+      state.doc = r.doc;
+      regenerate({ preview: true });
+      return;
+    }
+    if (d.kind === 'centre') {
+      var target = toWorld3(pane, xy[0], xy[1], w.c);
+      if (d.shift) {
+        // Shift locks the drag to whichever pane axis has moved further -- the
+        // ortho equivalent of a straight edge.
+        if (Math.abs(xy[0] - d.from[0]) > Math.abs(xy[1] - d.from[1])) target[pane.vi] = w.c[pane.vi];
+        else target[pane.hi] = w.c[pane.hi];
+      }
+      r = state.softRadius > 0
+        ? OPS.moldSeam(base, d.id, { c: target }, { radius: state.softRadius })
+        : OPS.dragSeam(base, d.id, { c: target });
+    } else if (d.kind === 'a' || d.kind === 'b') {
+      // Project the pointer onto the handle's own axis: the new semi-axis is how
+      // far along that axis the pointer got, measured in the pane and divided by
+      // how much of the axis the pane can see. (An axis seen edge-on has no
+      // handle to drag; the guard below leaves the value alone rather than
+      // dividing by zero, and the numeric field still works.)
+      var fr = D.weldFrame(w);
+      var vec = d.kind === 'a' ? fr.e1 : fr.e2;
+      var du = pane.hs * vec[pane.hi], dv = pane.vs * vec[pane.vi];
+      var len2 = du * du + dv * dv;
+      if (len2 > 1e-6) {
+        var cs = toScreen(pane, w.c);
+        var pu = (xy[0] - cs[0]) / pane.scale, pv = (xy[1] - cs[1]) / pane.scale;
+        var val = Math.max(5, (pu * du + pv * dv) / len2);
+        r = d.kind === 'a' ? OPS.setWidth(base, d.id, val) : OPS.setHeight(base, d.id, val);
+      }
+    } else if (d.kind === 'normal') {
+      // Rotate the normal about the pane's view axis by the angle the pointer
+      // swept about the dot: in profile that is RAKE, in plan it is the weld
+      // plane's heading. One formula, both panes.
+      // The angle is read straight off the SCREEN (y negated, because SVG y runs
+      // down and `viewAxis` is defined against a y-up frame). The axis signs are
+      // already baked into toScreen, so applying them again would flip the pane
+      // whose vs is -1 -- i.e. both of them.
+      var cs2 = toScreen(pane, w.c);
+      var nsc = toScreen(pane, V.add(w.c, w.n));
+      var a0 = Math.atan2(-(nsc[1] - cs2[1]), nsc[0] - cs2[0]);
+      var a1 = Math.atan2(-(xy[1] - cs2[1]), xy[0] - cs2[0]);
+      r = OPS.dragSeam(base, d.id, { n: V.rotAbout(w.n, pane.viewAxis, a1 - a0) });
+    } else if (d.kind === 'roll') {
+      r = OPS.setRoll(base, d.id, w.roll + (xy[0] - d.from[0]) * 0.25 * DEG);
+    }
+    if (!r) return;
+    if (r.detail && r.detail.topology && /->/.test(r.detail.topology)) {
+      state.topology = r.detail.topology.replace('->', ' \u2192 ');
+    }
+    d.last = r;
+    d.moved = true;
+    state.doc = r.doc;
+    regenerate({ preview: true });
+  }
+
+  // ==================================================================
+  // Developed panels strip
+  // ==================================================================
+  function setFlat(built) {
+    var host2 = document.getElementById('flat');
+    var old = host2.querySelector('svg');
+    if (old) old.parentNode.removeChild(old);
+    var s = svg('svg', { preserveAspectRatio: 'xMidYMid meet' });
+    var g = svg('g', null, s);
+
+    // SHELVES, not a single column: this pane is a wide-and-short strip now that
+    // the ortho views have the height, and a column of nine panels in it would
+    // scale to nothing. Wrap at the width that makes the whole block roughly the
+    // pane's own aspect ratio, so the patterns are as large as the box allows.
+    var pad = 60, items = built.panels.concat([built.floor]);
+    var boxes = items.map(function (p) { return bbox(p.outline); });
+    var area = boxes.reduce(function (t, b) { return t + (b.w + pad) * (b.h + pad); }, 0);
+    var aspect = Math.max(0.2, (host2.clientWidth || 800) / (host2.clientHeight || 300));
+    var wrapAt = Math.max(boxes.reduce(function (m, b) { return Math.max(m, b.w); }, 0),
+      Math.sqrt(area * aspect));
+    var x = 0, y = 0, rowH = 0, maxH = 0, maxW = 0;
+    items.forEach(function (p, k) {
+      var pts = p.outline;
+      var bb = boxes[k];
+      if (x > 0 && x + bb.w > wrapAt) { x = 0; y += rowH + pad; rowH = 0; }
+      var tx = -bb.x0 + x, ty = -bb.y0 + y;
+      var selected = (p.id === state.segment || p.mirrorOf === state.segment);
+      var path = svg('path', {
+        d: dOf(pts, tx, ty),
+        fill: p.role === 'floor' ? '#2a2016' : (selected ? '#3a3020' : '#1b222b'),
+        stroke: p.role === 'floor' ? '#e8b56b' : (selected ? '#e0a45c' : '#5d7ea6'),
+        'stroke-width': 3,
+      }, g);
+      if (p.role !== 'floor') {
+        path.setAttribute('class', 'panel');
+        path.addEventListener('click', function () { selectPanel(p); });
+      }
+      if (p.rulings) {
+        p.rulings.forEach(function (r) {
+          svg('path', { d: 'M' + (r[0][0] + tx) + ' ' + (r[0][1] + ty)
+            + 'L' + (r[1][0] + tx) + ' ' + (r[1][1] + ty),
+            stroke: '#33445a', 'stroke-width': 1.5, fill: 'none',
+            'pointer-events': 'none' }, g);
+        });
+      }
+      if (p.seamCurve) {
+        svg('path', { d: dOf(p.seamCurve, tx, ty, true), stroke: '#e8b56b',
+          'stroke-width': 3, fill: 'none', 'pointer-events': 'none' }, g);
+      }
+      svg('text', { x: tx + 10, y: ty + 46, fill: selected ? '#e0a45c' : '#8994a3',
+        'font-size': 46, 'pointer-events': 'none' }, g)
+        .textContent = (built.labels[p.id] || p.id);
+      x += bb.w + pad;
+      rowH = Math.max(rowH, bb.h);
+      maxW = Math.max(maxW, x);
+      maxH = Math.max(maxH, y + bb.h);
+    });
+    s.setAttribute('viewBox', (-pad) + ' ' + (-pad) + ' ' + (maxW + pad) + ' ' + (maxH + 2 * pad));
+    host2.appendChild(s);
+  }
+
+  function bbox(pts) {
+    var x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    pts.forEach(function (p) {
+      if (p[0] < x0) x0 = p[0]; if (p[0] > x1) x1 = p[0];
+      if (p[1] < y0) y0 = p[1]; if (p[1] > y1) y1 = p[1];
+    });
+    return { x0: x0, y0: y0, w: x1 - x0, h: y1 - y0 };
+  }
+  function dOf(pts, tx, ty, open) {
+    var d = '';
+    for (var i = 0; i < pts.length; i++) {
+      d += (i ? 'L' : 'M') + (pts[i][0] + tx).toFixed(2) + ' ' + (pts[i][1] + ty).toFixed(2);
+    }
+    return open ? d : d + 'Z';
+  }
+
+  // ==================================================================
+  // Checks report -- unchanged policy: editing never blocks, export does
+  // ==================================================================
+  function setReport(built, rep) {
+    var tb = document.querySelector('#report tbody');
+    tb.textContent = '';
+    var head = document.createElement('tr');
+    ['', 'check', 'where', 'value', 'gate', 'tier', ''].forEach(function (h) {
+      var th = document.createElement('th'); th.textContent = h; head.appendChild(th);
+    });
+    tb.appendChild(head);
+    // The analysis rows join the SAME table, tagged 'analysis' in the tier
+    // column. One place to look, and the tier is what says which of these
+    // could ever stop an export (none of them: the gate below is computed from
+    // `rep` alone, and `rep` has never heard of the observers).
+    var extra = state.analysis ? state.analysis.issues : [];
+    if (state.suggestion) extra = extra.concat(state.suggestion.issues);
+    var rows = rep.issues.concat(extra).sort(function (a, b) {
+      var rank = { error: 0, warn: 1, advisory: 2, ok: 3 };
+      return rank[a.level] - rank[b.level];
+    });
+    rows.forEach(function (i) {
+      var tr = document.createElement('tr');
+      tr.appendChild(cell(i.level === 'ok' ? '✓' : '●', i.level));
+      tr.appendChild(cell(i.id));
+      tr.appendChild(cell(i.where
+        ? (i.where.panel || i.where.a
+          || (i.where.weld != null ? 'W' + i.where.weld : '')
+          || i.where.analysis || '') : ''));
+      tr.appendChild(cell(fmt(i.value), null, true));
+      tr.appendChild(cell(i.tolerance == null ? '' : fmt(i.tolerance)
+        + (i.toleranceKind ? ' ' + i.toleranceKind : ''), null, true));
+      tr.appendChild(cell(i.tier || ''));
+      tr.appendChild(cell(i.level === 'ok' ? '' : i.message, 'msg'));
+      tb.appendChild(tr);
+    });
+    var gate = CK.exportGate(rep);
+    var pill = document.getElementById('gate');
+    pill.textContent = gate.allowed ? 'export allowed' : 'export refused';
+    pill.className = 'pill ' + (gate.allowed ? 'good' : 'bad');
+    pill.title = gate.message;
+  }
+  function cell(text, cls, num) {
+    var td = document.createElement('td');
+    td.textContent = text;
+    if (cls) td.className = cls;
+    if (num) td.className = (td.className ? td.className + ' ' : '') + 'num';
+    return td;
+  }
+  function fmt(v) {
+    if (v == null) return '';
+    if (typeof v !== 'number') return String(v);
+    if (v === 0) return '0';
+    if (!isFinite(v)) return '∞';
+    return Math.abs(v) < 1e-3 || Math.abs(v) > 1e5 ? v.toExponential(2) : v.toFixed(4);
+  }
+
+  // ==================================================================
+  // THE SECTION INSET -- B5's deliverable
+  // ==================================================================
+  /**
+   * The selected weld's own curve, drawn in the WELD'S OWN PLANE.
+   *
+   * Axes are the frame's (v, u) -- outboard to the right, up is up -- not the
+   * rolled (e1, e2). The rolled axes are where `a` and `b` are measured, but
+   * they spin with the weld, and a section that tumbles as you change the roll
+   * is unreadable. Drawing in (u, v) shows the section as it actually sits in
+   * the boat, with the roll visible as the tilt of the base ellipse.
+   *
+   * Three curves, and each says one thing:
+   *   - the dashed BASE ELLIPSE is {a, b, roll}: what the deviation is measured
+   *     against, so a handle at radius 1.0 is exactly on it;
+   *   - the solid PROFILE is the curve the loft actually reads;
+   *   - the RAYS from the centre to each handle are the direction the deviation
+   *     is free to move along -- radial, which is why the seam clock angle and
+   *     the floor landing are untouched by any of this (engine/doc.js header).
+   *
+   * The scale FREEZES for the duration of a gesture. Without that the box
+   * refits to the growing curve on every preview frame, the mm-per-pixel under
+   * the pointer changes mid-drag, and the handle runs away from the mouse.
+   */
+  var SECTION = { svg: null, view: null, frozen: null, box: null };
+  var SECTION_SAMPLES = 240;
+
+  /** Weld-plane 2-D coordinates (outboard, up) of an offset from the centre. */
+  function sectionUV(fr, off) { return [V.dot(off, fr.v), V.dot(off, fr.u)]; }
+
+  function drawSection() {
+    var s = SECTION.svg;
+    if (!s) return;
+    s.textContent = '';
+    var w = selectedWeld();
+    var box = SECTION.box;
+    var W = box.clientWidth || 250, H = box.clientHeight || 236;
+    SECTION.note.textContent = '';
+    if (!w) {
+      svg('text', { x: W / 2, y: H / 2, fill: '#55606f', 'font-size': 12,
+        'text-anchor': 'middle' }, s).textContent = 'select a weld';
+      SECTION.knots.disabled = true;
+      SECTION.mould.disabled = true;
+      SECTION.reset.disabled = true;
+      return;
+    }
+    SECTION.knots.disabled = false;
+    SECTION.mould.disabled = false;
+    SECTION.reset.disabled = !w.profile;
+
+    var fr = D.weldFrame(w);
+    var prof = [], base = [], rmax = 1e-6;
+    for (var i = 0; i <= SECTION_SAMPLES; i++) {
+      var t = 2 * Math.PI * i / SECTION_SAMPLES;
+      var e = D.weldBase(w, t, fr);
+      var b2 = sectionUV(fr, e);
+      var f = D.weldFactor(w, t, fr);
+      var p2 = [b2[0] * f, b2[1] * f];
+      base.push(b2); prof.push(p2);
+      rmax = Math.max(rmax, Math.hypot(b2[0], b2[1]), Math.hypot(p2[0], p2[1]));
+    }
+    var view = SECTION.frozen || {
+      cx: W / 2, cy: H / 2, k: (Math.min(W, H) / 2) * 0.80 / rmax,
+    };
+    SECTION.view = view;
+    var toS = function (p) { return [view.cx + view.k * p[0], view.cy - view.k * p[1]]; };
+    var dOfPts = function (pts) {
+      var out = '';
+      for (var j = 0; j < pts.length; j++) {
+        var q = toS(pts[j]);
+        out += (j ? 'L' : 'M') + q[0].toFixed(2) + ' ' + q[1].toFixed(2);
+      }
+      return out + 'Z';
+    };
+
+    // --- axes
+    svg('path', { d: 'M0 ' + view.cy + 'H' + W + 'M' + view.cx + ' 0V' + H,
+      stroke: '#222833', 'stroke-width': 1, fill: 'none', 'pointer-events': 'none' }, s);
+    // THE DEVIATION ITSELF, as a filled band between the two curves.
+    // A subtle moulding is a subtle picture -- 10% of a 220 mm radius is four
+    // pixels in a 236 px box -- and the number that matters to a designer is
+    // not where the curve IS but how far it has been moved. Two subpaths with
+    // the even-odd rule fill exactly the region between them, on both sides,
+    // with no case analysis about which curve is outside where.
+    svg('path', { d: dOfPts(prof) + dOfPts(base), 'fill-rule': 'evenodd',
+      fill: 'rgba(111,191,115,.22)', stroke: 'none', 'pointer-events': 'none' }, s);
+    svg('path', { d: dOfPts(base), stroke: '#46536a', 'stroke-width': 1.2,
+      'stroke-dasharray': '5 4', fill: 'none', 'pointer-events': 'none' }, s);
+    svg('path', { d: dOfPts(prof), stroke: '#7fb0e0', 'stroke-width': 2,
+      fill: 'none', 'pointer-events': 'none' }, s);
+
+    // --- the seam point: where the floor lands. Radial deviation cannot move
+    // it, and showing it here is how that stops being a claim in a comment.
+    var st = D.seamParam(w);
+    var sp = toS(sectionUV(fr, V.sub(D.weldPoint(w, st, fr), w.c)));
+    svg('circle', { cx: sp[0], cy: sp[1], r: 3.5, fill: '#e8b56b',
+      'pointer-events': 'none' }, s);
+
+    // --- one handle per knot station
+    var prep = D.profilePrepare(w.profile);
+    if (prep) {
+      var at = D.profileToStations(w.profile);
+      D.profileStations(prep.m).forEach(function (t, j) {
+        var b2 = sectionUV(fr, D.weldBase(w, t, fr));
+        var hs = toS([b2[0] * (1 + at[j]), b2[1] * (1 + at[j])]);
+        var b0 = toS([0, 0]);
+        svg('path', { d: 'M' + b0[0] + ' ' + b0[1] + 'L' + hs[0] + ' ' + hs[1],
+          stroke: '#2c3644', 'stroke-width': 1, fill: 'none',
+          'pointer-events': 'none' }, s);
+        // THREE colours, with a DEADBAND, and the deadband is the point: the
+        // station deviations come back out of a numerical solve, so a knot
+        // nobody has touched sits at +-1e-17 rather than at 0. A plain
+        // `dev >= 0` test then paints untouched handles green or amber at
+        // random, and the picture claims a moulding that is not there.
+        var dev = at[j];
+        var col = Math.abs(dev) < 1e-6 ? '#5d7ea6' : (dev > 0 ? '#6fbf73' : '#e0a45c');
+        var el = svg('circle', { cx: hs[0], cy: hs[1], r: 5.5, fill: col,
+          stroke: '#101216', 'stroke-width': 1.4, cursor: 'move' }, s);
+        el.dataset.handle = 'profile';
+        el.dataset.station = j;
+        svg('title', null, el).textContent = 'knot ' + j + ' at '
+          + fmtN(t / DEG, 0) + '° — radius ' + fmtN(100 * (1 + at[j]), 1)
+          + '% of the base ellipse; drag along the ray';
+      });
+      var ex = prep.extent();
+      SECTION.note.textContent = prep.m + ' knots · radius '
+        + fmtN(100 * ex.rMin, 1) + '–' + fmtN(100 * ex.rMax, 1) + '% of the ellipse'
+        + (ex.rMin > 0 ? '' : ' — the section crosses itself');
+    } else {
+      SECTION.note.textContent = w.profile
+        ? 'profile too short to be a spline — drawn as the plain ellipse'
+        : 'plain ellipse — press “mould” to add handles';
+    }
+    svg('text', { x: 7, y: 14, fill: '#55606f', 'font-size': 10 }, s)
+      .textContent = 'W' + w.id + ' · outboard →, up ↑';
+  }
+
+  /**
+   * A handle drag on the section inset.
+   *
+   * Same three-step contract as every pane gesture (see `bindPane`): the op is
+   * re-applied to the document as it was when the gesture STARTED, so 200
+   * pointer moves leave ONE entry on the undo stack and the result is a
+   * function of where the pointer IS, not of how it got there.
+   *
+   * The deviation is the pointer's position along the station's own RAY,
+   * divided by the base ellipse's reach along that same ray -- one projection,
+   * no rootfind, and exactly the number `editProfile` stores. The range clamp
+   * is a HANDLE limit, not a gate: a section folded through its own centre is a
+   * document warning and an export blocker, both of which the user can still
+   * reach by typing or by a wide drag; the clamp only stops the handle leaving
+   * the box entirely.
+   */
+  function bindSection() {
+    var s = SECTION.svg;
+    s.addEventListener('pointerdown', function (e) {
+      var t = e.target;
+      if (!t || !t.dataset || t.dataset.handle !== 'profile') return;
+      var w = selectedWeld();
+      if (!w) return;
+      s.setPointerCapture(e.pointerId);
+      SECTION.frozen = SECTION.view;
+      state.dragging = {
+        pane: SECTION, kind: 'profile', id: w.id, station: +t.dataset.station,
+        base: state.doc, baseWeld: D.clone(w), last: null, moved: false,
+      };
+      e.preventDefault();
+    });
+    s.addEventListener('pointermove', function (e) {
+      var d = state.dragging;
+      if (!d || d.pane !== SECTION) return;
+      var r = s.getBoundingClientRect();
+      d.at = [e.clientX - r.left, e.clientY - r.top];
+      requestPaint();
+    });
+    var end = function (e) {
+      var d = state.dragging;
+      if (!d || d.pane !== SECTION) return;
+      if (d.at) applyDrag(d, true);
+      state.dragging = null;
+      SECTION.frozen = null;
+      if (d.last && d.moved) { state.undo.push(d.last.inverse); regenerate(); }
+      else drawSection();
+      try { s.releasePointerCapture(e.pointerId); } catch (err) { /* gone */ }
+    };
+    s.addEventListener('pointerup', end);
+    s.addEventListener('pointercancel', end);
+  }
+
+  /** The station deviations a profile handle drag writes. */
+  function profileDrag(d) {
+    var w = d.baseWeld, view = SECTION.view;
+    if (!view) return null;
+    var prep = D.profilePrepare(w.profile);
+    if (!prep) return null;
+    var fr = D.weldFrame(w);
+    var t = 2 * Math.PI * d.station / prep.m;
+    var b2 = sectionUV(fr, D.weldBase(w, t, fr));
+    var den = b2[0] * b2[0] + b2[1] * b2[1];
+    if (!(den > 0)) return null;
+    var p2 = [(d.at[0] - view.cx) / view.k, -(d.at[1] - view.cy) / view.k];
+    var factor = (p2[0] * b2[0] + p2[1] * b2[1]) / den;
+    var dev = Math.max(-1.5, Math.min(3, factor - 1));
+    var at = D.profileToStations(w.profile);
+    at[d.station] = dev;
+    return OPS.editProfile(d.base, d.id, { at: at });
+  }
+
+  // ==================================================================
+  // Selection + the numeric inspector
+  // ==================================================================
+  function panelById(id) {
+    if (!state.built) return null;
+    for (var i = 0; i < state.built.panels.length; i++) {
+      if (state.built.panels[i].id === id) return state.built.panels[i];
+    }
+    return null;
+  }
+  function selectedWeld() {
+    if (state.weld == null) return null;
+    var i = D.byId(state.doc, state.weld);
+    return i < 0 ? null : state.doc.welds[i];
+  }
+
+  /**
+   * Clicking a starboard panel selects its PORT SOURCE. The document stores the
+   * port half only, so a starboard panel is not a thing an op can address --
+   * it is a reflection, and editing it means editing the panel it reflects.
+   */
+  function selectPanel(panel) {
+    var id = panel.role === 'starboard' ? panel.mirrorOf : panel.id;
+    state.segment = id;
+    var p = panelById(id);
+    if (p && D.byId(state.doc, state.weld) < 0) state.weld = null;
+    if (p && (state.weld !== p.weldA && state.weld !== p.weldB)) state.weld = p.weldA;
+    syncSelection();
+  }
+
+  /**
+   * The stored-segment index `ops.addSeam` wants, or null when the selection is
+   * not a segment between two stored welds.
+   */
+  function storedSegmentIndex() {
+    var p = panelById(state.segment);
+    if (p && p.role === 'port') {
+      var i = D.byId(state.doc, p.weldA);
+      if (i >= 0 && i < state.doc.welds.length - 1 && state.doc.welds[i + 1].id === p.weldB) {
+        return i;
+      }
+    }
+    // No panel selected: fall back to the segment that STARTS at the selected
+    // weld, so "select a dot, add a seam" works without a trip via the 3D view.
+    var j = D.byId(state.doc, state.weld);
+    return (j >= 0 && j < state.doc.welds.length - 1) ? j : null;
+  }
+
+  /**
+   * The numeric fields. EVERY handle is also a number, and the number goes
+   * through the SAME op the handle does (the plan: "typed numeric entry on
+   * every handle"). No field writes the document directly.
+   */
+  var FIELDS = [
+    { key: 'x', label: 'centre x', step: 5, dp: 1,
+      get: function (w) { return w.c[0]; },
+      set: function (w, v) { return dragTo(w, [v, w.c[1], w.c[2]]); } },
+    { key: 'y', label: 'centre y (port+)', step: 5, dp: 1,
+      get: function (w) { return w.c[1]; },
+      set: function (w, v) { return dragTo(w, [w.c[0], v, w.c[2]]); } },
+    { key: 'z', label: 'centre z (up)', step: 5, dp: 1,
+      get: function (w) { return w.c[2]; },
+      set: function (w, v) { return dragTo(w, [w.c[0], w.c[1], v]); } },
+    { key: 'a', label: 'semi-axis a', step: 5, dp: 2,
+      get: function (w) { return w.a; },
+      set: function (w, v) { return OPS.setWidth(state.doc, w.id, Math.max(1, v)); } },
+    { key: 'b', label: 'semi-axis b', step: 5, dp: 2,
+      get: function (w) { return w.b; },
+      set: function (w, v) { return OPS.setHeight(state.doc, w.id, Math.max(1, v)); } },
+    { key: 'rake', label: 'rake °', step: 1, dp: 2,
+      get: function (w) { return OPS.rakeOf(w) / DEG; },
+      set: function (w, v) {
+        return OPS.dragSeam(state.doc, w.id, { n: OPS.normalAtRake(w, v * DEG) });
+      } },
+    { key: 'roll', label: 'roll °', step: 1, dp: 2,
+      get: function (w) { return w.roll / DEG; },
+      set: function (w, v) { return OPS.setRoll(state.doc, w.id, v * DEG); } },
+    { key: 'seam', label: 'seam clock °', step: 1, dp: 2,
+      get: function (w) { return w.seam / DEG; },
+      set: function (w, v) { return OPS.setSeamPoint(state.doc, w.id, v * DEG); } },
+  ];
+
+  /** The centre fields honour the soft radius, exactly as the pane drag does. */
+  function dragTo(w, c) {
+    return state.softRadius > 0
+      ? OPS.moldSeam(state.doc, w.id, { c: c }, { radius: state.softRadius })
+      : OPS.dragSeam(state.doc, w.id, { c: c });
+  }
+
+  var inspector = document.getElementById('inspector');
+  var fieldInputs = {};
+  (function buildInspector() {
+    // ---- the section inset, first: it is the thing being edited, and the
+    // numeric fields below it are its size while the handles are its shape.
+    var hs = document.createElement('h2');
+    hs.textContent = 'section — profile';
+    inspector.appendChild(hs);
+    var box = document.createElement('div');
+    box.id = 'sectionBox';
+    inspector.appendChild(box);
+    SECTION.box = box;
+    SECTION.svg = svg('svg', { xmlns: SVGNS }, box);
+
+    var row = document.createElement('div');
+    row.className = 'field';
+    var knotLab = document.createElement('label');
+    knotLab.textContent = 'knots';
+    var knots = document.createElement('select');
+    [6, 8, 12, 16, 24].forEach(function (n) {
+      var o = document.createElement('option');
+      o.value = n; o.textContent = n;
+      if (n === D.PROFILE_DEFAULT_KNOTS) o.selected = true;
+      knots.appendChild(o);
+    });
+    knots.title = 'Knots round the section. Changing it RE-MOULDS the current '
+      + 'shape at the new resolution (one undo step), it does not flatten it.';
+    row.appendChild(knotLab); row.appendChild(knots);
+    inspector.appendChild(row);
+    SECTION.knots = knots;
+
+    var row2 = document.createElement('div');
+    row2.className = 'field';
+    var mould = document.createElement('button');
+    mould.id = 'btn-mould';
+    mould.textContent = 'mould section';
+    mould.title = 'Give this weld a profile: a flat deviation at the chosen '
+      + 'knot count, which IS the ellipse until a handle moves.';
+    var reset = document.createElement('button');
+    reset.id = 'btn-reset-profile';
+    reset.textContent = 'reset profile';
+    reset.title = 'ops.clearProfile — back to the plain {a, b, roll} ellipse.';
+    row2.appendChild(mould); row2.appendChild(reset);
+    inspector.appendChild(row2);
+    SECTION.mould = mould;
+    SECTION.reset = reset;
+
+    var snote = document.createElement('p');
+    snote.className = 'note';
+    inspector.appendChild(snote);
+    SECTION.note = snote;
+
+    knots.addEventListener('change', function () {
+      var w = selectedWeld();
+      if (w && w.profile) run(OPS.editProfile(state.doc, w.id, { knots: +knots.value }));
+    });
+    mould.addEventListener('click', function () {
+      var w = selectedWeld();
+      if (w) run(OPS.editProfile(state.doc, w.id, { knots: +knots.value }));
+    });
+    reset.addEventListener('click', function () {
+      var w = selectedWeld();
+      if (w && w.profile) run(OPS.clearProfile(state.doc, w.id));
+    });
+    bindSection();
+
+    var h = document.createElement('h2');
+    h.textContent = 'selected weld';
+    inspector.appendChild(h);
+    var idLine = document.createElement('div');
+    idLine.className = 'note'; idLine.id = 'weldline';
+    idLine.textContent = 'none';
+    inspector.appendChild(idLine);
+    FIELDS.forEach(function (f) {
+      var row = document.createElement('div');
+      row.className = 'field';
+      var lab = document.createElement('label');
+      lab.textContent = f.label;
+      var inp = document.createElement('input');
+      inp.type = 'number'; inp.step = f.step; inp.disabled = true;
+      inp.dataset.field = f.key;
+      // `change`, not `input`: an op per keystroke would put "1", "12", "120"
+      // on the undo stack while the user is still typing 1200.
+      inp.addEventListener('change', function () {
+        var w = selectedWeld();
+        if (!w) return;
+        var v = parseFloat(inp.value);
+        if (!isFinite(v)) { syncSelection(); return; }
+        run(f.set(w, v));
+      });
+      row.appendChild(lab); row.appendChild(inp);
+      inspector.appendChild(row);
+      fieldInputs[f.key] = inp;
+    });
+    var note = document.createElement('p');
+    note.className = 'note';
+    note.textContent = 'Every field is the same op the handle calls. Editing is '
+      + 'never blocked; only export is gated.';
+    inspector.appendChild(note);
+
+    var h2 = document.createElement('h2');
+    h2.textContent = 'panes';
+    inspector.appendChild(h2);
+    var note2 = document.createElement('p');
+    note2.className = 'note';
+    note2.innerHTML = 'Drag a dot to move it. Drag the background to pan, wheel to '
+      + 'zoom. Load a photo, tick <em>place</em>, then drag/wheel to register it '
+      + '(mm per image pixel is the number beside it). The underlay is session '
+      + 'state — it is never written into the boat document.';
+    inspector.appendChild(note2);
+
+    var h3 = document.createElement('h2');
+    h3.textContent = 'section handles';
+    inspector.appendChild(h3);
+    var note3 = document.createElement('p');
+    note3.className = 'note';
+    note3.innerHTML = 'Each handle rides one RAY from the weld centre, so a '
+      + 'moulded section keeps every clock angle it had — the seam point (amber '
+      + 'dot) and the floor landing do not move. The deviation is stored as a '
+      + 'ratio of the dashed base ellipse, so <em>a</em> and <em>b</em> still '
+      + 'resize the moulded shape as a whole.';
+    inspector.appendChild(note3);
+  })();
+
+  function syncSelection() {
+    var p = panelById(state.segment);
+    var w = selectedWeld();
+    var bits = [];
+    if (p) {
+      bits.push('panel ' + (state.built.labels[p.id] || p.id) + ' · ' + p.role + ' · '
+        + p.kind + (p.exact ? ' (closed form)' : ' (numerical)'));
+    }
+    if (w) {
+      bits.push('W' + w.id + (w.onCentreplane ? ' ON CENTREPLANE (pointed tip)' : ''));
+    }
+    // Surface the topology switch: it is the one edit that changes what the boat
+    // IS (a pointed tip and a bridged end are different documents' worth of
+    // panels), and it happens silently under the pointer.
+    if (state.topology) bits.push('topology ' + state.topology);
+    document.getElementById('sel').textContent = bits.length ? bits.join('  ·  ')
+      : 'click a dot in the top or side view';
+
+    var storedIdx = storedSegmentIndex();
+    var add = document.getElementById('btn-add');
+    add.disabled = storedIdx == null;
+    add.title = storedIdx == null
+      ? 'addSeam splits a segment between two STORED welds; a bridge span runs '
+        + 'from a weld to its own mirror, so there is nothing to insert between'
+      : 'insert a weld into the segment aft of W' + state.doc.welds[storedIdx].id
+        + ', interpolated along the loft';
+    document.getElementById('btn-del').disabled = !w || state.doc.welds.length <= 2;
+    document.getElementById('btn-undo').disabled = !state.undo.length;
+    document.getElementById('lock').checked = !!state.doc.locks.uniformB;
+
+    document.getElementById('weldline').textContent = w
+      ? ('W' + w.id + '  ·  ' + (w.onCentreplane ? 'on the centreplane (pointed tip)'
+          : 'off the mirror line') + (state.doc.locks.uniformB
+          ? '  ·  b is locked boat-wide' : ''))
+      : 'none — click a dot';
+    FIELDS.forEach(function (f) {
+      var inp = fieldInputs[f.key];
+      inp.disabled = !w;
+      inp.value = w ? fmtN(f.get(w), f.dp) : '';
+    });
+
+    if (state.built) { set3d(state.built); setFlat(state.built); }
+    drawPane(PANES.top);
+    drawPane(PANES.side);
+    drawSection();
+  }
+
+  // ==================================================================
+  // The driver
+  // ==================================================================
+  /**
+   * Rebuild everything from the document.
+   *
+   * `preview` runs the coarse sampling and SKIPS the gates: a pointer move is
+   * not the moment to integrate conservation over 96 Gauss panels per segment.
+   * The report is dimmed while it is stale so nobody reads a number that
+   * belongs to the shape from two frames ago.
+   *
+   * A build that THROWS does not take the editor with it. An edit is allowed to
+   * make a hopeless boat (that is the policy), and a hopeless boat is exactly
+   * where the numerics are entitled to give up; the last good build stays on
+   * screen and the failure is reported in the status line.
+   */
+  function regenerate(opts) {
+    var o = opts || {};
+    var t0 = performance.now();
+    var built;
+    try {
+      built = DV.build(state.doc, o.preview ? PREVIEW : BUILD);
+      state.error = null;
+    } catch (err) {
+      state.error = err && err.message ? err.message : String(err);
+      built = null;
+    }
+    var tBuild = performance.now() - t0;
+    if (built) state.built = built;
+    // A preview build is a different (coarser) boat, so the observers' answers
+    // would be about geometry nobody has agreed to yet. Drop them rather than
+    // show a waterline for last frame's hull.
+    if (o.preview) { state.analysis = null; state.suggestion = null; }
+    var footer = document.getElementById('footer');
+    if (!o.preview && state.built && !state.error) {
+      var t1 = performance.now();
+      state.rep = CK.report(state.built);
+      runAnalysis();
+      setReport(state.built, state.rep);
+      footer.className = '';
+      document.getElementById('stats').textContent =
+        'volume ' + (state.built.volume / 1e6).toFixed(1) + ' L · floor perimeter '
+        + state.built.floor.perimeter3D.toFixed(0) + ' mm · ease '
+        + state.built.floor.totalEase.toFixed(1) + ' mm · build ' + tBuild.toFixed(0)
+        + ' ms + checks ' + (performance.now() - t1).toFixed(0) + ' ms';
+    } else {
+      footer.className = 'stale';
+      drawFlotation();
+      document.getElementById('stats').textContent = state.error
+        ? ('BUILD FAILED: ' + state.error + ' — the document is still valid and undoable')
+        : ('preview · build ' + tBuild.toFixed(0) + ' ms · gates re-run on release');
+    }
+    document.getElementById('title').textContent =
+      state.doc.meta.name + ' — ' + state.doc.welds.length + ' stored welds'
+      + (state.built ? (' (' + state.built.ring.welds.length + ' derived), '
+        + state.built.panels.length + ' panels') : '');
+    syncSelection();
+    resize3d();
+  }
+
+  // ==================================================================
+  // THE ANALYSIS STRIP -- B6's deliverable. Reads; never writes.
+  // ==================================================================
+
+  var flotEl = document.getElementById('flot');
+  var loadField = document.getElementById('load');
+  var pressField = document.getElementById('press');
+
+  /**
+   * One observer pass over the current FULL build.
+   *
+   * Called from `regenerate` beside the gates, and from the load/pressure
+   * fields on their own (the geometry has not changed, only a number about the
+   * water). It never touches `state.doc`, and engine/analysis.js is written so
+   * that it could not: every function there takes the document and returns a
+   * plain readout.
+   */
+  function runAnalysis() {
+    if (!state.built || state.error) { state.analysis = null; return; }
+    var t0 = performance.now();
+    try {
+      state.analysis = AN.observe(state.built, {
+        loadKg: state.loadKg, pressurePa: state.pressurePa,
+      });
+      state.analysis.ms = performance.now() - t0;
+    } catch (err) {
+      state.analysis = null;
+      flotEl.textContent = 'analysis failed: ' + (err && err.message);
+      return;
+    }
+    drawFlotation();
+  }
+
+  function drawFlotation() {
+    var a = state.analysis;
+    if (!a) { flotEl.textContent = '—'; return; }
+    var f = a.flotation, h = a.hoop;
+    if (!f.floats) {
+      flotEl.innerHTML = '<span class="warnish">SWAMPS at ' + f.loadKg.toFixed(0)
+        + ' kg — this hull carries <b>' + f.swampLoadKg.toFixed(0)
+        + ' kg</b> with the sheer dry</span>';
+      return;
+    }
+    var pct = (100 * f.immersed.bathtubShare).toFixed(0);
+    flotEl.innerHTML =
+      'waterline <b>' + f.waterline.toFixed(1) + '</b> mm · freeboard <b>'
+      + f.freeboard.toFixed(0) + '</b> mm (' + f.freeboardMid.toFixed(0)
+      + ' over the floor) · displaced <b>' + (f.immersed.total / 1e6).toFixed(1)
+      + '</b> L = tube ' + (f.immersed.tube / 1e6).toFixed(1) + ' + floor '
+      + (f.immersed.bathtub / 1e6).toFixed(1) + ' (' + pct
+      + '%) · reserve <b>' + f.reserveRatio.toFixed(2) + '</b> · wetted '
+      + (f.wettedArea / 1e6).toFixed(2) + ' m² · hoop ≤ <b>'
+      + h.worst.tensionHeld.toFixed(2) + '</b> N/mm ('
+      + (100 * h.worst.utilisation).toFixed(0) + '% of fabric) · swamps at '
+      + f.swampLoadKg.toFixed(0) + ' kg';
+  }
+
+  loadField.addEventListener('input', function () {
+    state.loadKg = Math.max(1, +loadField.value || 1);
+    runAnalysis(); syncSelection();
+  });
+  pressField.addEventListener('input', function () {
+    state.pressurePa = Math.max(1, (+pressField.value || 0.15) * 6894.76);
+    runAnalysis(); setReport(state.built, state.rep);
+  });
+  document.getElementById('wl-show').addEventListener('change', function (e) {
+    state.showWaterline = e.target.checked;
+    syncSelection();
+  });
+
+  // ---------------------------------------------------------------- suggest
+  /**
+   * suggest seams: PREVIEW, then confirm.
+   *
+   * The proposal is data (engine/analysis.js returns op descriptors and never
+   * edits anything), so the button draws it as ghost dots and stops. Pressing
+   * apply replays the descriptors through `ops.apply` ONE AT A TIME, pushing
+   * each inverse -- so the undo stack is made of the same entries a hand edit
+   * would have left, and stepping back through them unwinds the suggestion.
+   */
+  var suggestBtn = document.getElementById('btn-suggest');
+  var applyBtn = document.getElementById('btn-suggest-ok');
+  var cancelBtn = document.getElementById('btn-suggest-no');
+
+  function setSuggestion(p) {
+    state.suggestion = p;
+    applyBtn.disabled = !p || !p.steps.length;
+    cancelBtn.disabled = !p;
+    if (state.built && state.rep) setReport(state.built, state.rep);
+    drawPane(PANES.top); drawPane(PANES.side);
+  }
+
+  suggestBtn.addEventListener('click', function () {
+    var cap = Math.max(5, +document.getElementById('cap').value || 55);
+    var want = Math.max(0, Math.round(+document.getElementById('tgt').value || 0));
+    var p;
+    try {
+      p = AN.suggestSeams(state.doc, { maxTurnDeg: cap, welds: want || null });
+    } catch (err) {
+      note('suggest failed: ' + err.message, true);
+      return;
+    }
+    setSuggestion(p);
+    note(p.steps.length
+      ? ('preview: ' + state.doc.welds.length + ' welds → ' + p.stations.length
+        + ' (' + p.inserted + ' inserted, ' + p.moved + ' moved), worst turn '
+        + p.worstTurnBeforeDeg.toFixed(0) + '° → ' + p.worstTurnDeg.toFixed(0)
+        + '° — apply or cancel')
+      : 'nothing to suggest: every turn is inside the cap, or the corners that '
+        + 'are not have no room to be split (see the table)');
+  });
+
+  applyBtn.addEventListener('click', function () {
+    var p = state.suggestion;
+    if (!p || !p.steps.length) return;
+    var n = 0;
+    for (var i = 0; i < p.steps.length; i++) {
+      var r = OPS.apply(state.doc, p.steps[i]);
+      state.undo.push(r.inverse);
+      state.doc = r.doc;
+      n++;
+    }
+    setSuggestion(null);
+    if (D.byId(state.doc, state.weld) < 0) state.weld = null;
+    state.segment = null;
+    regenerate();
+    note('applied ' + n + ' ops — undo steps back through them one at a time');
+  });
+
+  cancelBtn.addEventListener('click', function () {
+    setSuggestion(null);
+    note('');
+  });
+
+  /**
+   * Run one op. THIS IS THE WHOLE EDIT LOOP: a document goes in, a document
+   * comes out, the inverse goes on the undo stack, and everything on screen is
+   * recomputed from the new document. Nothing is mutated in place and no view
+   * holds state the document does not.
+   */
+  function run(r) {
+    if (!r) return;
+    // A PROPOSAL BELONGS TO THE DOCUMENT IT WAS COMPUTED FROM. Its steps carry
+    // the ids the inserted welds will take, and those are only right for that
+    // document -- so any other edit retires the preview rather than leaving a
+    // stale one that would apply somewhere else entirely.
+    if (state.suggestion) setSuggestion(null);
+    if (r.detail && r.detail.topology && /->/.test(r.detail.topology)) {
+      state.topology = r.detail.topology.replace('->', ' \u2192 ');
+    }
+    state.undo.push(r.inverse);
+    state.doc = r.doc;
+    if (r.detail && r.detail.newId != null) state.weld = r.detail.newId;
+    if (r.removedSegments.indexOf(state.segment) >= 0) state.segment = null;
+    regenerate();
+    if (window.console) {
+      console.log(r.op, r.args, 'changed', r.changedSegments,
+        'removed', r.removedSegments, r.detail);
+    }
+  }
+
+  document.getElementById('btn-add').addEventListener('click', function () {
+    var i = storedSegmentIndex();
+    if (i != null) run(OPS.addSeam(state.doc, i, 0.5));
+  });
+  document.getElementById('btn-del').addEventListener('click', function () {
+    if (state.weld != null && state.doc.welds.length > 2) {
+      var gone = state.weld;
+      state.weld = null;
+      run(OPS.removeSeam(state.doc, gone));
+    }
+  });
+  document.getElementById('lock').addEventListener('change', function (e) {
+    run(OPS.setLock(state.doc, 'uniformB', e.target.checked));
+  });
+  document.getElementById('soft').addEventListener('input', function (e) {
+    // A UI setting, not a document field: it shapes what the NEXT drag writes.
+    state.softRadius = Math.max(0, +e.target.value || 0);
+    drawPane(PANES.top); drawPane(PANES.side);
+  });
+  document.getElementById('btn-undo').addEventListener('click', function () {
+    var inv = state.undo.pop();
+    if (!inv) return;
+    if (state.suggestion) setSuggestion(null);
+    var r = OPS.apply(state.doc, inv);
+    state.doc = r.doc;                       // do NOT push this one's inverse
+    if (D.byId(state.doc, state.weld) < 0) state.weld = null;
+    regenerate();
+  });
+  document.getElementById('btn-fit').addEventListener('click', function () {
+    PANES.top.fitted = false; PANES.side.fitted = false;
+    drawPane(PANES.top); drawPane(PANES.side);
+  });
+
+  var picker = document.getElementById('tpl');
+  T.names().forEach(function (n) {
+    var o = document.createElement('option');
+    o.value = n;
+    o.textContent = T.LIBRARY[n]().meta.name;
+    picker.appendChild(o);
+  });
+  /** Everything a new boat resets, whatever it came from. */
+  function adopt(doc) {
+    state.doc = D.create(doc);
+    state.segment = null; state.weld = null; state.undo = []; state.topology = null;
+    state.suggestion = null; state.analysis = null;
+    // A new boat is a new fit; a pan or a zoom of the SAME boat is not
+    // (v3 amendment: "fix view2d fit() reset" -- the view must not jump back
+    // every time the geometry is rebuilt).
+    PANES.top.fitted = false; PANES.side.fitted = false;
+    regenerate();
+  }
+  function load(name) {
+    if (name === LINK_VALUE) { adopt(D.clone(linkedDoc)); return; }
+    if (picker.value !== name) picker.value = name;   // keep `reset` honest when
+                                                      // a script drove the load
+    adopt(T.template(name));
+  }
+
+  /**
+   * A document that arrived down a permalink. It is not in the library, so it
+   * gets its own entry in the picker -- and `reset` has to mean "back to the
+   * boat in the link", not "back to whatever template happens to be selected".
+   */
+  var LINK_VALUE = '__link';
+  var linkedDoc = null;
+  function loadLinked(doc) {
+    linkedDoc = D.clone(doc);
+    if (!picker.querySelector('option[value="' + LINK_VALUE + '"]')) {
+      var o = document.createElement('option');
+      o.value = LINK_VALUE;
+      picker.insertBefore(o, picker.firstChild);
+    }
+    picker.querySelector('option[value="' + LINK_VALUE + '"]').textContent =
+      'shared link — ' + doc.meta.name;
+    picker.value = LINK_VALUE;
+    adopt(doc);
+  }
+  picker.addEventListener('change', function (e) { load(e.target.value); });
+  document.getElementById('btn-reset').addEventListener('click', function () {
+    load(picker.value);
+  });
+
+  // ==================================================================
+  // Blueprint export -- the UI stays THIN. Every decision (what to draw,
+  // how to nest it, whether it may be exported at all) lives in
+  // engine/export-svg.js and engine/tile.js; this is a button, a filename
+  // and a Blob.
+  // ==================================================================
+
+  var noteEl = document.getElementById('exportNote');
+  function note(text, bad) {
+    noteEl.textContent = text || '';
+    noteEl.style.color = bad ? '#e2705f' : '#6f7c8c';
+  }
+  /** The date the LIBRARY refuses to read. Clocks belong in the UI. */
+  function today() { return new Date().toISOString().slice(0, 10); }
+  function fileBase() {
+    return (state.doc.meta.name || 'packraft').toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'packraft';
+  }
+  function download(blob, name) {
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url; a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 30000);
+  }
+
+  /**
+   * A FULL-resolution build for export, never the one on screen.
+   *
+   * A drag leaves `state.built` at PREVIEW sampling, which is right for a
+   * pointer and wrong for a cutting pattern: the outline a builder traces must
+   * not be a 16-ruling approximation of the one the gates passed. So export
+   * rebuilds and re-checks from the document, every time. It costs ~0.5 s on an
+   * explicit button press.
+   */
+  function buildForExport() {
+    var built = DV.build(state.doc, BUILD);
+    return { built: built, report: CK.report(built, { refine: false }) };
+  }
+
+  /**
+   * Blueprint options. `mirrorOnce` defaults ON here and OFF in the library:
+   * a DIY builder handed twice the paper they need has lost an afternoon, but
+   * a library that quietly halves what it was asked to draw surprises whoever
+   * calls it next. The full layout stays one click away.
+   */
+  var mirrorOnceBox = document.getElementById('mirror-once');
+  var rollField = document.getElementById('roll');
+  function exportOpts(rep) {
+    return {
+      now: today(),
+      report: rep,
+      mirrorOnce: mirrorOnceBox.checked,
+      // Fabric comes on a roll and the width is what you can buy, not what you
+      // would like. The packer treats it as the hard constraint.
+      sheetWidth: Math.max(200, +rollField.value || XSVG.DEFAULTS.sheetWidth),
+    };
+  }
+
+  document.getElementById('btn-svg').addEventListener('click', function () {
+    note('building…');
+    try {
+      var b = buildForExport();
+      var opts = exportOpts(b.report);
+      var svg = XSVG.render(b.built, opts);
+      download(new Blob([svg], { type: 'image/svg+xml' }),
+        fileBase() + (opts.mirrorOnce ? '-mirror-once' : '') + '.svg');
+      var d = XSVG.buildBody(b.built, opts);
+      note('SVG: ' + d.parts.length + ' patterns for '
+        + d.parts.reduce(function (s, p) { return s + p.qty; }, 0) + ' pieces, '
+        + (d.layout.usedLength / 1000).toFixed(2) + ' m × ' + d.layout.sheetWidth
+        + ' mm, ' + d.layout.wastePercent.toFixed(0) + '% waste');
+    } catch (err) {
+      note(err.message, true);
+    }
+  });
+
+  var pageSel = document.getElementById('page');
+  Object.keys(TILE.PAGE_SIZES).forEach(function (n) {
+    var o = document.createElement('option');
+    o.value = n;
+    o.textContent = n + ' (' + TILE.PAGE_SIZES[n].join('×') + ' mm)';
+    pageSel.appendChild(o);
+  });
+  pageSel.value = TILE.DEFAULTS.pageSize;
+
+  document.getElementById('btn-print').addEventListener('click', function () {
+    note('paginating…');
+    try {
+      var b = buildForExport();
+      var opts = exportOpts(b.report);
+      opts.pageSize = pageSel.value;
+      var html = TILE.renderPrintHtml(b.built, opts);
+      var blob = new Blob([html], { type: 'text/html' });
+      // The same comparison the document itself ran: fabric layout vs
+      // page-grid layouts, fewest sheets wins.
+      var chosen = TILE.layoutFor(b.built, Object.assign({}, TILE.DEFAULTS, opts));
+      var t = chosen.t;
+      // A blob: URL opened from a file:// page is at the mercy of the popup
+      // blocker and of the browser's file-origin rules, so the download is not
+      // a fallback for failure -- it is the same artefact by another route.
+      var w = window.open(URL.createObjectURL(blob), '_blank');
+      if (!w) {
+        download(blob, fileBase() + '-' + pageSel.value + '.html');
+        note(t.sheets + ' ' + pageSel.value + ' sheets as ' + t.cols + ' × ' + t.rows
+          + ' — popup blocked, downloaded instead');
+      } else {
+        note(t.sheets + ' ' + pageSel.value + ' sheets as ' + t.cols + ' × ' + t.rows
+          + ' (' + t.skipped + ' blank omitted, ' + chosen.mode + ' layout)');
+      }
+    } catch (err) {
+      note(err.message, true);
+    }
+  });
+
+  document.getElementById('btn-link').addEventListener('click', function () {
+    note('encoding…');
+    ENC.encode(state.doc).then(function (payload) {
+      var hash = ENC.hashFor(payload);
+      try {
+        history.replaceState(null, '', hash);
+      } catch (err) {
+        location.hash = hash;                 // file:// can refuse replaceState
+      }
+      return copyText(location.href).then(function (ok) {
+        note((ok ? 'link copied — ' : 'link in the address bar — ')
+          + payload.length + ' chars');
+      });
+    }).catch(function (err) {
+      note('link failed: ' + err.message, true);
+    });
+  });
+
+  /**
+   * Clipboard, both ways round. `navigator.clipboard` needs a secure context
+   * and a file:// page is not one, so the execCommand path is not legacy
+   * cruft here -- it is the path that actually runs.
+   */
+  function copyText(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text).then(function () { return true; },
+        function () { return legacyCopy(text); });
+    }
+    return Promise.resolve(legacyCopy(text));
+  }
+  function legacyCopy(text) {
+    try {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = document.execCommand('copy');
+      ta.remove();
+      return ok;
+    } catch (err) {
+      return false;
+    }
+  }
+
+  window.addEventListener('resize', function () {
+    resize3d();
+    drawPane(PANES.top);
+    drawPane(PANES.side);
+  });
+
+  // Scripting/debug handle -- lets tests and tooling drive the editor, the
+  // same convention as P.app in the main application.
+  window.demo = {
+    state: state, load: load, regenerate: regenerate, run: run,
+    camera: camera, controls: controls, scene: scene,
+    panes: PANES, ops: OPS, doc: D,
+    /** Where a weld's dot is right now, in CLIENT pixels -- drive a real drag. */
+    weldClient: function (paneName, id) {
+      var pane = PANES[paneName];
+      var i = D.byId(state.doc, id);
+      return i < 0 ? null : clientAt(pane, state.doc.welds[i].c);
+    },
+    /** Where any world point lands, for handles and assertions. */
+    clientAt: function (paneName, p) { return clientAt(PANES[paneName], p); },
+    /** The client position of a named handle of the selected weld. */
+    handleClient: function (paneName, kind, weldId) {
+      var pane = PANES[paneName];
+      var sel = '[data-handle="' + kind + '"]'
+        + (weldId == null ? '' : '[data-weld="' + weldId + '"]');
+      var el = pane.layers.handles.querySelector(sel);
+      if (!el) return null;
+      var r = el.getBoundingClientRect();
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    },
+    select: function (id) { state.weld = id; syncSelection(); },
+    json: function () { return D.toJSON(state.doc); },
+    /** The section inset, and the client position of one of its knot handles. */
+    section: SECTION,
+    sectionHandleClient: function (station) {
+      var el = SECTION.svg.querySelector('[data-handle="profile"][data-station="'
+        + station + '"]');
+      if (!el) return null;
+      var r = el.getBoundingClientRect();
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    },
+    /** Where a radial factor at a knot station lands, in CLIENT pixels. */
+    sectionRadiusClient: function (station, factor) {
+      var w = selectedWeld();
+      var view = SECTION.view;
+      if (!w || !view || !w.profile) return null;
+      var prep = D.profilePrepare(w.profile);
+      if (!prep) return null;
+      var fr = D.weldFrame(w);
+      var b2 = sectionUV(fr, D.weldBase(w, 2 * Math.PI * station / prep.m, fr));
+      var r = SECTION.svg.getBoundingClientRect();
+      return { x: r.left + view.cx + view.k * b2[0] * factor,
+               y: r.top + view.cy - view.k * b2[1] * factor };
+    },
+    // The blueprint side, driveable headlessly: the same calls the buttons make.
+    loadLinked: loadLinked,
+    permalink: function () { return ENC.encode(state.doc); },
+    exportSvg: function () {
+      var b = buildForExport();
+      return XSVG.render(b.built, exportOpts(b.report));
+    },
+    printHtml: function (pageSize) {
+      var b = buildForExport();
+      var o = exportOpts(b.report);
+      o.pageSize = pageSize || pageSel.value;
+      return TILE.renderPrintHtml(b.built, o);
+    },
+    mirrorOnce: function (on) {
+      if (on != null) mirrorOnceBox.checked = !!on;
+      return mirrorOnceBox.checked;
+    },
+    // The analysis strip, driveable headlessly: the same calls the fields and
+    // the buttons make, so a screenshot test drives the real thing.
+    analysis: function () { return state.analysis; },
+    setLoad: function (kg) {
+      loadField.value = kg;
+      loadField.dispatchEvent(new Event('input'));
+      return state.analysis;
+    },
+    setPressurePsi: function (psi) {
+      pressField.value = psi;
+      pressField.dispatchEvent(new Event('input'));
+      return state.analysis;
+    },
+    suggest: function (opts) {
+      if (opts && opts.maxTurnDeg != null) {
+        document.getElementById('cap').value = opts.maxTurnDeg;
+      }
+      if (opts && opts.welds != null) document.getElementById('tgt').value = opts.welds;
+      suggestBtn.click();
+      return state.suggestion;
+    },
+    applySuggestion: function () { applyBtn.click(); },
+    cancelSuggestion: function () { cancelBtn.click(); },
+  };
+
+  /**
+   * `#d=<payload>` on the URL wins over the default template.
+   *
+   * Decoding is async (CompressionStream is a stream), so the default boat is
+   * built first and the linked one replaces it a frame later. That ordering is
+   * deliberate: a corrupt or truncated link leaves a working editor with a
+   * message, rather than an empty page.
+   */
+  regenerate();
+  (function openHash() {
+    var payload = ENC.payloadFromHash(location.hash);
+    if (!payload) return;
+    note('opening link…');
+    ENC.decode(payload).then(function (doc) {
+      loadLinked(doc);
+      note('opened from link — ' + doc.meta.name);
+    }).catch(function (err) {
+      note('link not readable: ' + err.message, true);
+    });
+  })();
+})();
+</script>
+
+</body>
+</html>

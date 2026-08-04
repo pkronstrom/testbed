@@ -1,0 +1,5 @@
+{
+  "name": "Packraft Designer",
+  "description": "Design a heat-welded packraft from a template, then export its 1:1 cutting pattern.",
+  "tags": ["geometry", "offline", "no-deps"]
+}

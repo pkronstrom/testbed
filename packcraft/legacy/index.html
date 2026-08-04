@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Packraft Designer</title>
+<link rel="stylesheet" href="../app/app.css">
+</head>
+<body>
+
+<header id="topbar">
+  <span class="brand">Packraft Designer</span>
+  <span class="stage">Phase 3 — analysis</span>
+  <span class="spacer"></span>
+  <span class="modes">
+    <button class="mode" data-mode="3d">3D</button>
+    <button class="mode" data-mode="hull">Hull</button>
+    <button class="mode" data-mode="panels">Panels</button>
+    <button class="mode" data-mode="split">Split</button>
+  </span>
+  <button id="btn-undo" title="Undo (Ctrl+Z)">Undo</button>
+  <button id="btn-redo" title="Redo (Ctrl+Shift+Z)">Redo</button>
+  <button id="btn-reset" title="Back to the reference design">Reset</button>
+  <button id="btn-diy" title="The DIY Packraft kit boat: bridged blunt bow, pointed stern, seven panels">DIY Packraft</button>
+  <button id="btn-measured" title="Apply the hull proportions measured off a real Alpacka-style boat, keeping your LOA and interior length">Measured hull</button>
+  <button id="btn-link" title="Copy a permalink to this design">Copy link</button>
+  <button id="btn-export" title="Download the 1:1 cutting pattern as one SVG">Export blueprint</button>
+  <select id="page-size" title="Sheet size for the tiled print">
+    <option>A3</option><option>A4</option><option>Letter</option>
+    <option>Tabloid</option><option>A1</option><option>A0</option>
+  </select>
+  <button id="btn-print" title="Open a tiled, print-ready document at 1:1">Print tiled</button>
+</header>
+
+<main>
+  <aside id="rail"></aside>
+  <section id="stage">
+    <div id="panes">
+      <div id="view3d"></div>
+      <div id="view2d"></div>
+    </div>
+    <div id="issues"></div>
+  </section>
+  <aside id="metrics"></aside>
+</main>
+
+<footer id="bottombar">
+  <span class="metric"><b id="m-segments">–</b><i>panels</i></span>
+  <span class="metric"><b id="m-mismatch">–</b><i>max mated-edge mismatch</i></span>
+  <span class="metric"><b id="m-deviation">–</b><i>outline deviation</i></span>
+  <span class="metric"><b id="m-loa">–</b><i>LOA</i></span>
+  <span class="metric"><b id="m-beam">–</b><i>beam</i></span>
+  <span class="metric"><b id="m-dia">–</b><i>tube &#8960;</i></span>
+  <span class="metric"><b id="m-reserve">–</b><i>reserve ratio</i></span>
+  <span class="metric"><b id="m-fabric">–</b><i>fabric</i></span>
+  <span class="metric"><b id="m-waste">–</b><i>waste</i></span>
+  <span class="spacer"></span>
+  <span class="metric"><b id="m-time">–</b><i>regenerate</i></span>
+</footer>
+
+<!-- three.js, vendored as classic scripts (r147, MIT). No CDN: the app must
+     work offline from file://, and ES-module imports are blocked there. -->
+<script src="../vendor/three.min.js"></script>
+<script src="../vendor/OrbitControls.js"></script>
+
+<!-- packraft-core: pure, DOM-free, identical files run under node --test -->
+<script src="../packraft-core/vec3.js"></script>
+<script src="../packraft-core/quad.js"></script>
+<script src="../packraft-core/constants.js"></script>
+<script src="../packraft-core/curves.js"></script>
+<script src="../packraft-core/params.js"></script>
+<script src="../packraft-core/skeleton.js"></script>
+<script src="../packraft-core/develop.js"></script>
+<script src="../packraft-core/panels.js"></script>
+<script src="../packraft-core/nest.js"></script>
+<script src="../packraft-core/export-svg.js"></script>
+<script src="../packraft-core/tile.js"></script>
+<script src="../packraft-core/analysis.js"></script>
+<script src="../packraft-core/encode.js"></script>
+
+<!-- app: vanilla DOM, depends on core and never the other way round -->
+<script src="../app/state.js"></script>
+<script src="../app/view3d.js"></script>
+<script src="../app/view2d.js"></script>
+<script src="../app/ui.js"></script>
+<script src="../app/rail.js"></script>
+<script src="../app/main.js"></script>
+
+</body>
+</html>
